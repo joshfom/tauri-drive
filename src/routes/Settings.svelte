@@ -2,6 +2,8 @@
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { save, open } from '@tauri-apps/plugin-dialog';
+  import { check } from '@tauri-apps/plugin-updater';
+  import { relaunch } from '@tauri-apps/plugin-process';
   import type { R2Credentials } from '../lib/types';
 
   let accountId = '';
@@ -16,6 +18,12 @@
   let showCredentials = false;
   let exporting = false;
   let importing = false;
+  
+  // Update state
+  let checkingForUpdates = false;
+  let updateCheckResult: 'none' | 'available' | 'latest' | 'error' = 'none';
+  let updateVersion = '';
+  let updateError = '';
 
   onMount(async () => {
     // Try to load saved bucket
@@ -161,6 +169,34 @@
       messageType = 'error';
     } finally {
       importing = false;
+    }
+  }
+
+  async function checkForUpdates() {
+    checkingForUpdates = true;
+    updateError = '';
+    updateCheckResult = 'none';
+    
+    try {
+      const update = await check();
+      
+      if (update) {
+        updateCheckResult = 'available';
+        updateVersion = update.version;
+        // Store the update object globally so UpdateScreen in App.svelte can use it
+        (window as any).__pendingUpdate = update;
+        // Dispatch custom event to show update screen
+        window.dispatchEvent(new CustomEvent('show-update-screen', { detail: update }));
+      } else {
+        updateCheckResult = 'latest';
+        message = 'You are running the latest version!';
+        messageType = 'success';
+      }
+    } catch (e) {
+      updateCheckResult = 'error';
+      updateError = `Failed to check for updates: ${e}`;
+    } finally {
+      checkingForUpdates = false;
     }
   }
 </script>
@@ -350,14 +386,59 @@
         </div>
       </div>
 
-      <!-- About -->
+      <!-- About & Updates -->
       <div class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl">
-        <div class="p-4">
-          <h3 class="font-medium text-gray-900 dark:text-white mb-1">Cloudflare Backup</h3>
+        <div class="p-4 border-b border-gray-200 dark:border-gray-700">
+          <h3 class="font-medium text-gray-900 dark:text-white">About & Updates</h3>
           <p class="text-sm text-gray-500 dark:text-gray-400">
             A secure desktop application for backing up files to Cloudflare R2 storage.
           </p>
           <p class="text-xs text-gray-400 dark:text-gray-500 mt-2">Version 1.0.0</p>
+        </div>
+        
+        <div class="p-4 space-y-4">
+          <!-- Update Error -->
+          {#if updateError}
+            <div class="p-3 bg-red-50 dark:bg-red-900/10 border border-red-200 dark:border-red-800 rounded-lg">
+              <p class="text-sm text-red-800 dark:text-red-200">{updateError}</p>
+            </div>
+          {/if}
+
+          <!-- Update Available Notice -->
+          {#if updateCheckResult === 'available'}
+            <div class="p-3 bg-blue-50 dark:bg-blue-900/10 border border-blue-200 dark:border-blue-800 rounded-lg">
+              <div class="flex items-center gap-2">
+                <svg class="w-5 h-5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10"/>
+                </svg>
+                <span class="text-sm font-medium text-blue-800 dark:text-blue-200">Update v{updateVersion} available!</span>
+              </div>
+            </div>
+          {/if}
+
+          <!-- Check for Updates Button -->
+          <button
+            on:click={checkForUpdates}
+            disabled={checkingForUpdates}
+            class="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50 transition-colors"
+          >
+            {#if checkingForUpdates}
+              <svg class="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <span>Checking for updates...</span>
+            {:else}
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+              </svg>
+              <span>Check for Updates</span>
+            {/if}
+          </button>
+
+          <p class="text-xs text-gray-500 dark:text-gray-400 text-center">
+            Updates are checked automatically when the app starts.
+          </p>
         </div>
       </div>
     </div>

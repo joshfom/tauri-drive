@@ -3,10 +3,12 @@
   import Router from 'svelte-spa-router';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import { check, type Update } from '@tauri-apps/plugin-updater';
   import Browser from './routes/Browser.svelte';
   import Settings from './routes/Settings.svelte';
   import Transfers from './routes/Transfers.svelte';
   import SyncFolders from './routes/SyncFolders.svelte';
+  import UpdateScreen from './components/UpdateScreen.svelte';
   import type { UploadProgress, DownloadProgress } from './lib/types';
 
   const routes = {
@@ -34,12 +36,40 @@
   let uploadMap = new Map<string, boolean>();
   let downloadMap = new Map<string, boolean>();
 
+  // Update status
+  let pendingUpdate: Update | null = null;
+  let showUpdateScreen = false;
+  let updateDismissedUntil: number | null = null; // Timestamp when user clicked "later"
+
   async function checkConnection() {
     try {
       connectionStatus = await invoke<ConnectionStatus>('check_connection');
     } catch (e) {
       connectionStatus = { connected: false, bucket: null, error: String(e) };
     }
+  }
+
+  async function checkForUpdates() {
+    try {
+      // Don't check if user dismissed recently (within 1 hour)
+      if (updateDismissedUntil && Date.now() < updateDismissedUntil) {
+        return;
+      }
+
+      const update = await check();
+      if (update) {
+        pendingUpdate = update;
+        showUpdateScreen = true;
+      }
+    } catch (e) {
+      console.error('Failed to check for updates:', e);
+    }
+  }
+
+  function handleUpdateLater() {
+    showUpdateScreen = false;
+    // Don't show again for 1 hour
+    updateDismissedUntil = Date.now() + (60 * 60 * 1000);
   }
 
   function handleRouteChange(event: any) {
@@ -49,6 +79,18 @@
   onMount(async () => {
     checkConnection();
     checkInterval = setInterval(checkConnection, 30000);
+
+    // Auto-check for updates on startup (after a short delay)
+    setTimeout(() => {
+      checkForUpdates();
+    }, 3000);
+
+    // Listen for manual update check from Settings
+    const handleShowUpdateScreen = (event: CustomEvent) => {
+      pendingUpdate = event.detail;
+      showUpdateScreen = true;
+    };
+    window.addEventListener('show-update-screen', handleShowUpdateScreen as EventListener);
 
     // Listen for upload/download events to track active transfers
     unlistenUpload = await listen<UploadProgress>('upload-progress', (event) => {
@@ -214,3 +256,11 @@
     {/if}
   </main>
 </div>
+
+<!-- Update Screen Modal -->
+{#if showUpdateScreen && pendingUpdate}
+  <UpdateScreen 
+    update={pendingUpdate} 
+    on:later={handleUpdateLater}
+  />
+{/if}

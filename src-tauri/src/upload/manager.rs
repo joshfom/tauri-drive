@@ -21,7 +21,9 @@ impl UploadManager {
         chunk_size: i64,
     ) -> Result<String> {
         let upload_id = Uuid::new_v4().to_string();
-        let _file_name = std::path::Path::new(file_path)
+        // Normalize path separators for cross-platform compatibility (Windows uses \)
+        let normalized_path = file_path.replace('\\', "/");
+        let _file_name = std::path::Path::new(&normalized_path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
@@ -128,7 +130,9 @@ impl UploadManager {
 
         if let Some(row) = row {
             let file_path: String = row.try_get("file_path")?;
-            let file_name = std::path::Path::new(&file_path)
+            // Normalize path separators for cross-platform compatibility (Windows uses \)
+            let normalized_path = file_path.replace('\\', "/");
+            let file_name = std::path::Path::new(&normalized_path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
@@ -186,7 +190,9 @@ impl UploadManager {
         let mut uploads = Vec::new();
         for row in rows {
             let file_path: String = row.try_get("file_path")?;
-            let file_name = std::path::Path::new(&file_path)
+            // Normalize path separators for cross-platform compatibility (Windows uses \)
+            let normalized_path = file_path.replace('\\', "/");
+            let file_name = std::path::Path::new(&normalized_path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")

@@ -123,6 +123,85 @@ pub async fn put_object(
     Ok(response.e_tag().unwrap_or("").to_string())
 }
 
+/// Upload progress callback type
+pub type UploadProgressCallback = Box<dyn Fn(i64, i64, f64, i64) + Send + Sync>;
+
+/// Upload a file with progress tracking
+pub async fn put_object_with_progress<F>(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    file_path: &str,
+    progress_callback: F,
+) -> Result<String>
+where
+    F: Fn(i64, i64, f64, i64) + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    
+    let path = std::path::Path::new(file_path);
+    let file_size = tokio::fs::metadata(path).await?.len() as i64;
+    
+    // For very small files (< 1MB), just upload directly without chunked progress
+    if file_size < 1024 * 1024 {
+        let body = ByteStream::from_path(path).await?;
+        let response = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(body)
+            .send()
+            .await?;
+        
+        // Emit final progress
+        progress_callback(file_size, file_size, 0.0, 0);
+        return Ok(response.e_tag().unwrap_or("").to_string());
+    }
+
+    // For larger files, read in chunks and track progress
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut data = Vec::with_capacity(file_size as usize);
+    
+    let chunk_size = 256 * 1024; // 256KB chunks for progress reporting
+    let mut buffer = vec![0u8; chunk_size];
+    let mut total_read: i64 = 0;
+    let start_time = std::time::Instant::now();
+    
+    loop {
+        let bytes_read = file.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        
+        data.extend_from_slice(&buffer[..bytes_read]);
+        total_read += bytes_read as i64;
+        
+        // Calculate speed and ETA
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 { total_read as f64 / elapsed } else { 0.0 };
+        let remaining = file_size - total_read;
+        let eta = if speed > 0.0 { (remaining as f64 / speed) as i64 } else { 0 };
+        
+        // Report progress during read phase (50% of total progress)
+        progress_callback(total_read / 2, file_size, speed, eta);
+    }
+    
+    // Now upload the data
+    let body = ByteStream::from(data);
+    let response = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(body)
+        .send()
+        .await?;
+    
+    // Emit final progress
+    progress_callback(file_size, file_size, 0.0, 0);
+    
+    Ok(response.e_tag().unwrap_or("").to_string())
+}
+
 pub async fn put_object_from_bytes(
     client: &Client,
     bucket: &str,

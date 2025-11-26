@@ -5,10 +5,12 @@ mod upload;
 mod crypto;
 
 use r2::R2Client;
+use r2::multipart::MultipartUpload;
 use db::Database;
 use upload::UploadManager;
 use utils::{R2Object, R2Credentials, UploadProgress, UploadStatus};
 use std::sync::Arc;
+use std::collections::HashMap;
 use tokio::sync::Mutex;
 use tauri::{Manager, Emitter};
 
@@ -16,6 +18,8 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub r2_client: Arc<Mutex<Option<R2Client>>>,
     pub upload_manager: Arc<UploadManager>,
+    /// Active multipart uploads that can be paused/cancelled
+    pub active_uploads: Arc<Mutex<HashMap<String, Arc<MultipartUpload>>>>,
 }
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -591,8 +595,9 @@ async fn upload_file_with_progress(
             .await
             .map_err(|e| e.to_string())?;
 
-        // Get file name
-        let file_name = std::path::Path::new(&local_path)
+        // Get file name - normalize path separators for Windows compatibility
+        let normalized_path = local_path.replace('\\', "/");
+        let file_name = std::path::Path::new(&normalized_path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
@@ -692,12 +697,52 @@ async fn upload_file_with_progress(
                 e.to_string()
             })?;
     } else {
-        // For smaller files, use simple put_object
-        r2::operations::put_object(
+        // For smaller files, emit a progress event before starting
+        let progress_event = UploadProgress {
+            id: upload_id.clone(),
+            file_name: file_name.clone(),
+            file_path: local_path.clone(),
+            remote_path: remote_key.clone(),
+            total_size: file_size,
+            uploaded_size: 0,
+            progress: 0.0,
+            speed: 0.0,
+            eta: 0,
+            status: UploadStatus::Uploading,
+            error_message: None,
+        };
+        app.emit("upload-progress", &progress_event).ok();
+
+        // For smaller files, use simple put_object with progress tracking
+        r2::operations::put_object_with_progress(
             &client_clone,
             &bucket_clone,
             &remote_key,
             &local_path,
+            {
+                let app = app.clone();
+                let upload_id = upload_id.clone();
+                let file_name = file_name.clone();
+                let local_path = local_path.clone();
+                let remote_key = remote_key.clone();
+                move |uploaded, total, speed, eta| {
+                    let progress_pct = if total > 0 { (uploaded as f64 / total as f64) * 100.0 } else { 0.0 };
+                    let progress_event = UploadProgress {
+                        id: upload_id.clone(),
+                        file_name: file_name.clone(),
+                        file_path: local_path.clone(),
+                        remote_path: remote_key.clone(),
+                        total_size: total,
+                        uploaded_size: uploaded,
+                        progress: progress_pct,
+                        speed,
+                        eta,
+                        status: UploadStatus::Uploading,
+                        error_message: None,
+                    };
+                    app.emit("upload-progress", &progress_event).ok();
+                }
+            },
         )
         .await
         .map_err(|e| {
@@ -746,7 +791,92 @@ async fn cancel_upload(
         .update_upload_status(&upload_id, "cancelled", None, None)
         .await
         .map_err(|e| e.to_string())?;
+    
+    // Cancel the active multipart upload if exists
+    let active_uploads = app_state.active_uploads.lock().await;
+    if let Some(upload) = active_uploads.get(&upload_id) {
+        upload.cancel();
+    }
+    
     Ok(())
+}
+
+#[tauri::command]
+async fn pause_upload(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    upload_id: String,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+    
+    // Update status to paused
+    app_state.upload_manager
+        .update_upload_status(&upload_id, "paused", None, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    // Pause the active multipart upload if exists
+    let active_uploads = app_state.active_uploads.lock().await;
+    if let Some(upload) = active_uploads.get(&upload_id) {
+        upload.pause();
+    }
+    
+    // Get current upload info to emit event
+    if let Ok(Some(upload_progress)) = app_state.upload_manager.get_upload(&upload_id).await {
+        app.emit("upload-progress", &upload_progress).ok();
+    }
+    
+    Ok(())
+}
+
+#[tauri::command]
+async fn resume_upload(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    upload_id: String,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+    
+    // Update status to uploading
+    app_state.upload_manager
+        .update_upload_status(&upload_id, "uploading", None, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    // Resume the active multipart upload if exists
+    let active_uploads = app_state.active_uploads.lock().await;
+    if let Some(upload) = active_uploads.get(&upload_id) {
+        upload.resume();
+    }
+    
+    // Get current upload info to emit event
+    if let Ok(Some(upload_progress)) = app_state.upload_manager.get_upload(&upload_id).await {
+        app.emit("upload-progress", &upload_progress).ok();
+    }
+    
+    Ok(())
+}
+
+#[tauri::command]
+async fn retry_upload(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    upload_id: String,
+) -> Result<String, String> {
+    // Get the failed upload info
+    let (local_path, remote_key) = {
+        let app_state = state.lock().await;
+        let upload = app_state.upload_manager
+            .get_upload(&upload_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("Upload not found")?;
+        
+        (upload.file_path, upload.remote_path)
+    };
+    
+    // Start a new upload with the same paths
+    upload_file_with_progress(app, state, local_path, remote_key).await
 }
 
 #[tauri::command]
@@ -1003,6 +1133,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let db = tauri::async_runtime::block_on(async {
                 Database::new(None).await.expect("Failed to initialize database")
@@ -1014,6 +1146,7 @@ pub fn run() {
                 db: Arc::new(db),
                 r2_client: Arc::new(Mutex::new(None)),
                 upload_manager: Arc::new(upload_manager),
+                active_uploads: Arc::new(Mutex::new(HashMap::new())),
             }));
 
             app.manage(app_state);
@@ -1034,6 +1167,9 @@ pub fn run() {
             delete_file,
             get_active_uploads,
             cancel_upload,
+            pause_upload,
+            resume_upload,
+            retry_upload,
             create_folder,
             list_directory,
             check_connection,

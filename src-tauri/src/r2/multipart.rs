@@ -31,6 +31,7 @@ pub struct MultipartUpload {
     upload_id: String,
     chunk_size: usize,
     cancelled: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 impl MultipartUpload {
@@ -62,6 +63,7 @@ impl MultipartUpload {
             upload_id,
             chunk_size: chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE).max(MIN_CHUNK_SIZE),
             cancelled: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -75,6 +77,18 @@ impl MultipartUpload {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+    
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+    
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+    
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
     }
 
     async fn upload_part_internal(
@@ -159,7 +173,7 @@ impl MultipartUpload {
     pub async fn upload_file_concurrent<F>(
         &self,
         file_path: &str,
-        mut progress_callback: F,
+        progress_callback: F,
     ) -> Result<Vec<(i32, String)>>
     where
         F: FnMut(UploadProgressInfo) + Send + 'static,
@@ -190,10 +204,21 @@ impl MultipartUpload {
         let mut offset: u64 = 0;
 
         while offset < file_size as u64 {
+            // Check for cancellation
             if self.is_cancelled() {
                 log::info!("Upload cancelled, aborting...");
                 self.abort().await.ok();
                 return Err(anyhow::anyhow!("Upload cancelled"));
+            }
+            
+            // Wait while paused
+            while self.is_paused() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                if self.is_cancelled() {
+                    log::info!("Upload cancelled while paused, aborting...");
+                    self.abort().await.ok();
+                    return Err(anyhow::anyhow!("Upload cancelled"));
+                }
             }
 
             let bytes_to_read = std::cmp::min(chunk_size as u64, file_size as u64 - offset) as usize;
@@ -211,6 +236,7 @@ impl MultipartUpload {
             let total_uploaded_clone = total_uploaded.clone();
             let progress_callback_clone = progress_callback.clone();
             let cancelled = self.cancelled.clone();
+            let paused = self.paused.clone();
             let current_part = part_number;
             let chunk_len = buffer.len() as i64;
 
@@ -218,8 +244,15 @@ impl MultipartUpload {
                 // Acquire semaphore permit to limit concurrency
                 let _permit = sem.acquire().await.unwrap();
 
-                if cancelled.load(Ordering::SeqCst) {
-                    return Err(anyhow::anyhow!("Upload cancelled"));
+                // Check for cancellation or wait while paused
+                loop {
+                    if cancelled.load(Ordering::SeqCst) {
+                        return Err(anyhow::anyhow!("Upload cancelled"));
+                    }
+                    if !paused.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
 
                 log::debug!("Uploading part {} ({} bytes)", current_part, chunk_len);
