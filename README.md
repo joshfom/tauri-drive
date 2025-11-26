@@ -1,5 +1,7 @@
 # Cloudflare Backup
 
+[![Tests](https://github.com/joshfom/tauri-drive/actions/workflows/test.yml/badge.svg)](https://github.com/joshfom/tauri-drive/actions/workflows/test.yml)
+
 A beautiful, fast desktop app for backing up your files to Cloudflare R2 storage. Built with Tauri, Svelte 5, and Rust.
 
 ## ✨ Features
