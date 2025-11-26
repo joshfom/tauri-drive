@@ -161,4 +161,135 @@ mod tests {
         assert_eq!(crypto.decrypt(&encrypted1).unwrap(), original);
         assert_eq!(crypto.decrypt(&encrypted2).unwrap(), original);
     }
+
+    #[test]
+    fn test_empty_string() {
+        let crypto = Crypto::new().unwrap();
+        let original = "";
+        
+        let encrypted = crypto.encrypt(original).unwrap();
+        let decrypted = crypto.decrypt(&encrypted).unwrap();
+        
+        assert_eq!(decrypted, original);
+    }
+
+    #[test]
+    fn test_unicode_strings() {
+        let crypto = Crypto::new().unwrap();
+        let original = "日本語テスト 🔐 密码测试";
+        
+        let encrypted = crypto.encrypt(original).unwrap();
+        let decrypted = crypto.decrypt(&encrypted).unwrap();
+        
+        assert_eq!(decrypted, original);
+    }
+
+    #[test]
+    fn test_long_string() {
+        let crypto = Crypto::new().unwrap();
+        let original = "a".repeat(10000);
+        
+        let encrypted = crypto.encrypt(&original).unwrap();
+        let decrypted = crypto.decrypt(&encrypted).unwrap();
+        
+        assert_eq!(decrypted, original);
+    }
+
+    #[test]
+    fn test_special_characters() {
+        let crypto = Crypto::new().unwrap();
+        let original = "!@#$%^&*()_+-=[]{}|;':\",./<>?`~\n\t\r";
+        
+        let encrypted = crypto.encrypt(original).unwrap();
+        let decrypted = crypto.decrypt(&encrypted).unwrap();
+        
+        assert_eq!(decrypted, original);
+    }
+
+    #[test]
+    fn test_invalid_encrypted_data() {
+        let crypto = Crypto::new().unwrap();
+        
+        // Invalid base64
+        let result = crypto.decrypt("not-valid-base64!!!");
+        assert!(result.is_err());
+        
+        // Too short (less than nonce size)
+        let short_data = BASE64.encode(&[1, 2, 3]);
+        let result = crypto.decrypt(&short_data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hash_deterministic() {
+        let value = "test-value";
+        
+        let hash1 = Crypto::hash(value);
+        let hash2 = Crypto::hash(value);
+        
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_hash_different_values() {
+        let hash1 = Crypto::hash("value1");
+        let hash2 = Crypto::hash("value2");
+        
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_hash_not_reversible() {
+        let original = "secret-value";
+        let hash = Crypto::hash(original);
+        
+        // Hash should be different from original
+        assert_ne!(hash, original);
+        
+        // Hash should be base64 encoded
+        assert!(BASE64.decode(&hash).is_ok());
+    }
+
+    #[test]
+    fn test_encrypted_is_base64() {
+        let crypto = Crypto::new().unwrap();
+        let encrypted = crypto.encrypt("test").unwrap();
+        
+        // Should be valid base64
+        let decoded = BASE64.decode(&encrypted);
+        assert!(decoded.is_ok());
+        
+        // Should contain nonce (12 bytes) + ciphertext (at least 16 bytes for tag)
+        let data = decoded.unwrap();
+        assert!(data.len() >= NONCE_SIZE + 16);
+    }
+
+    #[test]
+    fn test_consistent_decryption() {
+        let crypto = Crypto::new().unwrap();
+        let original = "consistent-test";
+        
+        let encrypted = crypto.encrypt(original).unwrap();
+        
+        // Decrypt multiple times should give same result
+        for _ in 0..5 {
+            let decrypted = crypto.decrypt(&encrypted).unwrap();
+            assert_eq!(decrypted, original);
+        }
+    }
+
+    #[test]
+    fn test_credentials_encryption() {
+        let crypto = Crypto::new().unwrap();
+        
+        // Test realistic credential values
+        let access_key = "AKIAIOSFODNN7EXAMPLE";
+        let secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        
+        let encrypted_access = crypto.encrypt(access_key).unwrap();
+        let encrypted_secret = crypto.encrypt(secret_key).unwrap();
+        
+        assert_eq!(crypto.decrypt(&encrypted_access).unwrap(), access_key);
+        assert_eq!(crypto.decrypt(&encrypted_secret).unwrap(), secret_key);
+    }
 }

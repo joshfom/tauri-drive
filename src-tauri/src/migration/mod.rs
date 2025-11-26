@@ -12,7 +12,7 @@ const SALT_SIZE: usize = 16;
 const BACKUP_MAGIC: &[u8] = b"TAURIDRIVE_BKP1"; // Version 1 backup format
 
 /// Backup data structure containing all exportable app data
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BackupData {
     pub version: u32,
     pub app_version: String,
@@ -23,7 +23,7 @@ pub struct BackupData {
     pub upload_history: Vec<UploadHistoryBackup>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CredentialsBackup {
     pub bucket_name: String,
     pub account_id: String,
@@ -32,7 +32,7 @@ pub struct CredentialsBackup {
     pub endpoint: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SyncFolderBackup {
     pub local_path: String,
     pub remote_path: String,
@@ -40,13 +40,13 @@ pub struct SyncFolderBackup {
     pub enabled: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SettingBackup {
     pub key: String,
     pub value: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UploadHistoryBackup {
     pub file_path: String,
     pub remote_path: String,
@@ -150,9 +150,8 @@ pub fn decrypt_backup(encrypted: &[u8], password: &str) -> Result<BackupData> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_encrypt_decrypt_backup() {
-        let backup = BackupData {
+    fn create_test_backup() -> BackupData {
+        BackupData {
             version: 1,
             app_version: "0.1.0".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
@@ -163,10 +162,35 @@ mod tests {
                 secret_access_key: "secret123".to_string(),
                 endpoint: "https://test.r2.cloudflarestorage.com".to_string(),
             }),
-            sync_folders: vec![],
-            settings: vec![],
-            upload_history: vec![],
-        };
+            sync_folders: vec![
+                SyncFolderBackup {
+                    local_path: "/home/user/docs".to_string(),
+                    remote_path: "docs/".to_string(),
+                    sync_mode: "upload_only".to_string(),
+                    enabled: true,
+                },
+            ],
+            settings: vec![
+                SettingBackup {
+                    key: "theme".to_string(),
+                    value: "dark".to_string(),
+                },
+            ],
+            upload_history: vec![
+                UploadHistoryBackup {
+                    file_path: "/home/user/docs/file.txt".to_string(),
+                    remote_path: "docs/file.txt".to_string(),
+                    total_size: 1024,
+                    status: "completed".to_string(),
+                    completed_at: Some("2024-01-01T12:00:00Z".to_string()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_backup() {
+        let backup = create_test_backup();
         
         let password = "test-password-123";
         let encrypted = encrypt_backup(&backup, password).unwrap();
@@ -176,6 +200,29 @@ mod tests {
         assert_eq!(decrypted.app_version, backup.app_version);
         assert!(decrypted.credentials.is_some());
         assert_eq!(decrypted.credentials.unwrap().bucket_name, "test-bucket");
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_with_all_data() {
+        let backup = create_test_backup();
+        let password = "secure-password-456";
+        
+        let encrypted = encrypt_backup(&backup, password).unwrap();
+        let decrypted = decrypt_backup(&encrypted, password).unwrap();
+        
+        // Verify all data is preserved
+        assert_eq!(decrypted.sync_folders.len(), 1);
+        assert_eq!(decrypted.sync_folders[0].local_path, "/home/user/docs");
+        assert_eq!(decrypted.sync_folders[0].remote_path, "docs/");
+        assert!(decrypted.sync_folders[0].enabled);
+        
+        assert_eq!(decrypted.settings.len(), 1);
+        assert_eq!(decrypted.settings[0].key, "theme");
+        assert_eq!(decrypted.settings[0].value, "dark");
+        
+        assert_eq!(decrypted.upload_history.len(), 1);
+        assert_eq!(decrypted.upload_history[0].total_size, 1024);
+        assert_eq!(decrypted.upload_history[0].status, "completed");
     }
 
     #[test]
@@ -194,5 +241,145 @@ mod tests {
         let result = decrypt_backup(&encrypted, "wrong-password");
         
         assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("incorrect password"));
+    }
+
+    #[test]
+    fn test_backup_without_credentials() {
+        let backup = BackupData {
+            version: 1,
+            app_version: "0.1.0".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            credentials: None,
+            sync_folders: vec![],
+            settings: vec![],
+            upload_history: vec![],
+        };
+        
+        let password = "test-password";
+        let encrypted = encrypt_backup(&backup, password).unwrap();
+        let decrypted = decrypt_backup(&encrypted, password).unwrap();
+        
+        assert!(decrypted.credentials.is_none());
+    }
+
+    #[test]
+    fn test_magic_header_present() {
+        let backup = create_test_backup();
+        let encrypted = encrypt_backup(&backup, "password").unwrap();
+        
+        // Check that magic header is at the beginning
+        assert!(encrypted.starts_with(BACKUP_MAGIC));
+    }
+
+    #[test]
+    fn test_invalid_magic_header() {
+        let mut invalid_data = b"INVALID_HEADER".to_vec();
+        invalid_data.extend_from_slice(&[0u8; 100]); // Pad with zeros
+        
+        let result = decrypt_backup(&invalid_data, "password");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("wrong format"));
+    }
+
+    #[test]
+    fn test_truncated_backup() {
+        let backup = create_test_backup();
+        let encrypted = encrypt_backup(&backup, "password").unwrap();
+        
+        // Truncate to just the header
+        let truncated = &encrypted[..BACKUP_MAGIC.len() + 10];
+        let result = decrypt_backup(truncated, "password");
+        
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_different_passwords_different_output() {
+        let backup = create_test_backup();
+        
+        let encrypted1 = encrypt_backup(&backup, "password1").unwrap();
+        let encrypted2 = encrypt_backup(&backup, "password2").unwrap();
+        
+        // Different passwords should produce different ciphertext
+        // (Note: Even same password produces different output due to random salt/nonce)
+        assert_ne!(encrypted1, encrypted2);
+    }
+
+    #[test]
+    fn test_same_password_different_output() {
+        let backup = create_test_backup();
+        let password = "same-password";
+        
+        let encrypted1 = encrypt_backup(&backup, password).unwrap();
+        let encrypted2 = encrypt_backup(&backup, password).unwrap();
+        
+        // Same password should produce different ciphertext due to random salt/nonce
+        assert_ne!(encrypted1, encrypted2);
+        
+        // But both should decrypt correctly
+        let decrypted1 = decrypt_backup(&encrypted1, password).unwrap();
+        let decrypted2 = decrypt_backup(&encrypted2, password).unwrap();
+        
+        assert_eq!(decrypted1.version, decrypted2.version);
+    }
+
+    #[test]
+    fn test_empty_password() {
+        let backup = create_test_backup();
+        let password = "";
+        
+        // Empty password should still work (though not recommended)
+        let encrypted = encrypt_backup(&backup, password).unwrap();
+        let decrypted = decrypt_backup(&encrypted, password).unwrap();
+        
+        assert_eq!(decrypted.version, backup.version);
+    }
+
+    #[test]
+    fn test_unicode_password() {
+        let backup = create_test_backup();
+        let password = "密码🔐パスワード";
+        
+        let encrypted = encrypt_backup(&backup, password).unwrap();
+        let decrypted = decrypt_backup(&encrypted, password).unwrap();
+        
+        assert_eq!(decrypted.version, backup.version);
+    }
+
+    #[test]
+    fn test_long_password() {
+        let backup = create_test_backup();
+        let password = "a".repeat(1000); // Very long password
+        
+        let encrypted = encrypt_backup(&backup, &password).unwrap();
+        let decrypted = decrypt_backup(&encrypted, &password).unwrap();
+        
+        assert_eq!(decrypted.version, backup.version);
+    }
+
+    #[test]
+    fn test_key_derivation_consistency() {
+        let password = "test-password";
+        let salt = [0u8; SALT_SIZE]; // Fixed salt for testing
+        
+        let key1 = derive_key_from_password(password, &salt);
+        let key2 = derive_key_from_password(password, &salt);
+        
+        // Same password and salt should produce same key
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_key_derivation_salt_sensitivity() {
+        let password = "test-password";
+        let salt1 = [0u8; SALT_SIZE];
+        let salt2 = [1u8; SALT_SIZE];
+        
+        let key1 = derive_key_from_password(password, &salt1);
+        let key2 = derive_key_from_password(password, &salt2);
+        
+        // Different salt should produce different key
+        assert_ne!(key1, key2);
     }
 }
