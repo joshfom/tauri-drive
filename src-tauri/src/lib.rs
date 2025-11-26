@@ -1,3 +1,6 @@
+// Allow unused code in library - some functions are for future use or exported for flexibility
+#![allow(dead_code)]
+
 mod r2;
 mod db;
 mod utils;
