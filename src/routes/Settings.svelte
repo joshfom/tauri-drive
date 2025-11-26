@@ -25,6 +25,34 @@
   let updateVersion = '';
   let updateError = '';
 
+  // Migration state
+  let showMigrationExport = false;
+  let showMigrationImport = false;
+  let migrationPassword = '';
+  let migrationConfirmPassword = '';
+  let migrationExporting = false;
+  let migrationImporting = false;
+  let migrationPreview: MigrationPreview | null = null;
+  let migrationError = '';
+
+  interface MigrationPreview {
+    version: number;
+    app_version: string;
+    created_at: string;
+    has_credentials: boolean;
+    bucket_name: string | null;
+    sync_folders_count: number;
+    settings_count: number;
+    upload_history_count: number;
+  }
+
+  interface MigrationResult {
+    credentials_imported: boolean;
+    sync_folders_imported: number;
+    settings_imported: number;
+    upload_history_imported: number;
+  }
+
   onMount(async () => {
     // Try to load saved bucket
     try {
@@ -198,6 +226,146 @@
     } finally {
       checkingForUpdates = false;
     }
+  }
+
+  async function handleMigrationExport() {
+    if (migrationPassword.length < 6) {
+      migrationError = 'Password must be at least 6 characters';
+      return;
+    }
+    if (migrationPassword !== migrationConfirmPassword) {
+      migrationError = 'Passwords do not match';
+      return;
+    }
+
+    migrationError = '';
+    migrationExporting = true;
+
+    try {
+      const savePath = await save({
+        defaultPath: 'cloudflare-backup-migration.tdbak',
+        filters: [{ name: 'Tauri Drive Backup', extensions: ['tdbak'] }],
+      });
+
+      if (!savePath) {
+        migrationExporting = false;
+        return;
+      }
+
+      await invoke('export_migration_backup', { 
+        filePath: savePath, 
+        password: migrationPassword 
+      });
+      
+      message = 'Migration backup exported successfully! Keep the password safe.';
+      messageType = 'success';
+      showMigrationExport = false;
+      migrationPassword = '';
+      migrationConfirmPassword = '';
+    } catch (e) {
+      migrationError = `Export failed: ${e}`;
+    } finally {
+      migrationExporting = false;
+    }
+  }
+
+  async function handleMigrationImportSelect() {
+    migrationError = '';
+    migrationPreview = null;
+
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: 'Tauri Drive Backup', extensions: ['tdbak'] }],
+      });
+
+      if (!selected || Array.isArray(selected)) {
+        return;
+      }
+
+      // Store the selected file path
+      (window as any).__migrationFilePath = selected;
+      showMigrationImport = true;
+    } catch (e) {
+      migrationError = `Failed to select file: ${e}`;
+    }
+  }
+
+  async function handleMigrationPreview() {
+    if (migrationPassword.length < 6) {
+      migrationError = 'Please enter your backup password';
+      return;
+    }
+
+    migrationError = '';
+    migrationImporting = true;
+
+    try {
+      const filePath = (window as any).__migrationFilePath;
+      migrationPreview = await invoke<MigrationPreview>('preview_migration_backup', {
+        filePath,
+        password: migrationPassword,
+      });
+    } catch (e) {
+      migrationError = `${e}`;
+      migrationPreview = null;
+    } finally {
+      migrationImporting = false;
+    }
+  }
+
+  async function handleMigrationImport() {
+    migrationError = '';
+    migrationImporting = true;
+
+    try {
+      const filePath = (window as any).__migrationFilePath;
+      const result = await invoke<MigrationResult>('import_migration_backup', {
+        filePath,
+        password: migrationPassword,
+      });
+
+      let summary = 'Migration complete! Imported: ';
+      const parts = [];
+      if (result.credentials_imported) parts.push('R2 credentials');
+      if (result.sync_folders_imported > 0) parts.push(`${result.sync_folders_imported} sync folders`);
+      if (result.settings_imported > 0) parts.push(`${result.settings_imported} settings`);
+      
+      message = summary + (parts.length > 0 ? parts.join(', ') : 'nothing new');
+      messageType = 'success';
+      
+      showMigrationImport = false;
+      migrationPassword = '';
+      migrationPreview = null;
+
+      // Reload to apply imported settings
+      if (result.credentials_imported) {
+        try {
+          const loadResult = await invoke<string>('load_and_connect');
+          const savedBucket = await invoke<string | null>('get_saved_bucket');
+          if (savedBucket) {
+            currentBucket = savedBucket;
+            isConnected = true;
+            showCredentials = false;
+          }
+        } catch (e) {
+          // Connection may fail, that's okay
+        }
+      }
+    } catch (e) {
+      migrationError = `Import failed: ${e}`;
+    } finally {
+      migrationImporting = false;
+    }
+  }
+
+  function closeMigrationDialogs() {
+    showMigrationExport = false;
+    showMigrationImport = false;
+    migrationPassword = '';
+    migrationConfirmPassword = '';
+    migrationPreview = null;
+    migrationError = '';
   }
 </script>
 
@@ -386,6 +554,57 @@
         </div>
       </div>
 
+      <!-- Move to New Computer -->
+      <div class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl">
+        <div class="p-4 border-b border-gray-200 dark:border-gray-700">
+          <div class="flex items-center gap-3">
+            <div class="w-10 h-10 bg-purple-500 rounded-lg flex items-center justify-center">
+              <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/>
+              </svg>
+            </div>
+            <div>
+              <h3 class="font-medium text-gray-900 dark:text-white">Move to New Computer</h3>
+              <p class="text-sm text-gray-500 dark:text-gray-400">Transfer all settings and data securely</p>
+            </div>
+          </div>
+        </div>
+        
+        <div class="p-4 space-y-4">
+          <p class="text-sm text-gray-600 dark:text-gray-400">
+            Create an encrypted backup of your entire setup including credentials, sync folders, and settings. 
+            Import on your new computer to restore everything.
+          </p>
+          
+          <div class="flex gap-3">
+            <button
+              on:click={() => { showMigrationExport = true; migrationError = ''; }}
+              disabled={!isConnected}
+              class="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400 rounded-lg transition-colors"
+            >
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+              </svg>
+              Create Backup
+            </button>
+            
+            <button
+              on:click={handleMigrationImportSelect}
+              class="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-purple-700 dark:text-purple-300 border border-purple-300 dark:border-purple-600 rounded-lg hover:bg-purple-50 dark:hover:bg-purple-900/20 transition-colors"
+            >
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 4H6a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-2m-4-1v8m0 0l3-3m-3 3L9 8m-5 5h2.586a1 1 0 01.707.293l2.414 2.414a1 1 0 00.707.293h3.172a1 1 0 00.707-.293l2.414-2.414a1 1 0 01.707-.293H20"/>
+              </svg>
+              Restore Backup
+            </button>
+          </div>
+          
+          <p class="text-xs text-gray-500 dark:text-gray-400">
+            Backups are encrypted with a password you choose. Keep your password safe!
+          </p>
+        </div>
+      </div>
+
       <!-- About & Updates -->
       <div class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl">
         <div class="p-4 border-b border-gray-200 dark:border-gray-700">
@@ -444,3 +663,226 @@
     </div>
   </div>
 </div>
+
+<!-- Migration Export Modal -->
+{#if showMigrationExport}
+  <div class="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div class="bg-white dark:bg-gray-800 rounded-2xl shadow-xl max-w-md w-full overflow-hidden">
+      <div class="p-6 border-b border-gray-200 dark:border-gray-700">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 bg-purple-500 rounded-lg flex items-center justify-center">
+            <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+            </svg>
+          </div>
+          <div>
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Create Encrypted Backup</h3>
+            <p class="text-sm text-gray-500 dark:text-gray-400">Secure your data with a password</p>
+          </div>
+        </div>
+      </div>
+      
+      <div class="p-6 space-y-4">
+        {#if migrationError}
+          <div class="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+            <p class="text-sm text-red-700 dark:text-red-400">{migrationError}</p>
+          </div>
+        {/if}
+        
+        <div class="space-y-2">
+          <label for="migration-password" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+            Password (minimum 6 characters)
+          </label>
+          <input
+            id="migration-password"
+            type="password"
+            bind:value={migrationPassword}
+            placeholder="Enter a strong password"
+            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+          />
+        </div>
+        
+        <div class="space-y-2">
+          <label for="migration-confirm-password" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+            Confirm Password
+          </label>
+          <input
+            id="migration-confirm-password"
+            type="password"
+            bind:value={migrationConfirmPassword}
+            placeholder="Confirm your password"
+            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+          />
+        </div>
+        
+        <div class="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg">
+          <p class="text-sm text-amber-700 dark:text-amber-400">
+            ⚠️ Keep this password safe! You'll need it to restore the backup on your new computer.
+          </p>
+        </div>
+      </div>
+      
+      <div class="p-6 border-t border-gray-200 dark:border-gray-700 flex gap-3 justify-end">
+        <button
+          on:click={closeMigrationDialogs}
+          disabled={migrationExporting}
+          class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50"
+        >
+          Cancel
+        </button>
+        <button
+          on:click={handleMigrationExport}
+          disabled={migrationExporting || migrationPassword.length < 6}
+          class="px-4 py-2 text-sm font-medium text-white bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400 rounded-lg transition-colors flex items-center gap-2"
+        >
+          {#if migrationExporting}
+            <svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            Creating Backup...
+          {:else}
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"/>
+            </svg>
+            Create & Save Backup
+          {/if}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- Migration Import Modal -->
+{#if showMigrationImport}
+  <div class="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div class="bg-white dark:bg-gray-800 rounded-2xl shadow-xl max-w-md w-full overflow-hidden">
+      <div class="p-6 border-b border-gray-200 dark:border-gray-700">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 bg-purple-500 rounded-lg flex items-center justify-center">
+            <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 4H6a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-2m-4-1v8m0 0l3-3m-3 3L9 8m-5 5h2.586a1 1 0 01.707.293l2.414 2.414a1 1 0 00.707.293h3.172a1 1 0 00.707-.293l2.414-2.414a1 1 0 01.707-.293H20"/>
+            </svg>
+          </div>
+          <div>
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Restore Backup</h3>
+            <p class="text-sm text-gray-500 dark:text-gray-400">Import settings from another device</p>
+          </div>
+        </div>
+      </div>
+      
+      <div class="p-6 space-y-4">
+        {#if migrationError}
+          <div class="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+            <p class="text-sm text-red-700 dark:text-red-400">{migrationError}</p>
+          </div>
+        {/if}
+        
+        {#if !migrationPreview}
+          <!-- Password entry step -->
+          <div class="space-y-2">
+            <label for="migration-import-password" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+              Enter Backup Password
+            </label>
+            <input
+              id="migration-import-password"
+              type="password"
+              bind:value={migrationPassword}
+              placeholder="Password used when creating the backup"
+              class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+            />
+          </div>
+          
+          <div class="flex gap-3 justify-end">
+            <button
+              on:click={closeMigrationDialogs}
+              class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              on:click={handleMigrationPreview}
+              disabled={migrationPassword.length < 6}
+              class="px-4 py-2 text-sm font-medium text-white bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400 rounded-lg transition-colors"
+            >
+              Decrypt & Preview
+            </button>
+          </div>
+        {:else}
+          <!-- Preview step -->
+          <div class="space-y-3">
+            <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+              <p class="text-xs text-gray-500 dark:text-gray-400 mb-1">Backup Created</p>
+              <p class="text-sm font-medium text-gray-900 dark:text-white">
+                {new Date(migrationPreview.created_at).toLocaleString()}
+              </p>
+            </div>
+            
+            <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+              <p class="text-xs text-gray-500 dark:text-gray-400 mb-1">App Version</p>
+              <p class="text-sm font-medium text-gray-900 dark:text-white">
+                {migrationPreview.app_version}
+              </p>
+            </div>
+            
+            <div class="grid grid-cols-2 gap-3">
+              <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg text-center">
+                <p class="text-2xl font-bold text-purple-600">{migrationPreview.has_credentials ? 1 : 0}</p>
+                <p class="text-xs text-gray-500 dark:text-gray-400">Credentials</p>
+                {#if migrationPreview.bucket_name}
+                  <p class="text-xs text-gray-400 truncate">{migrationPreview.bucket_name}</p>
+                {/if}
+              </div>
+              <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg text-center">
+                <p class="text-2xl font-bold text-purple-600">{migrationPreview.sync_folders_count}</p>
+                <p class="text-xs text-gray-500 dark:text-gray-400">Sync Folders</p>
+              </div>
+              <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg text-center">
+                <p class="text-2xl font-bold text-purple-600">{migrationPreview.settings_count}</p>
+                <p class="text-xs text-gray-500 dark:text-gray-400">Settings</p>
+              </div>
+              <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg text-center">
+                <p class="text-2xl font-bold text-purple-600">{migrationPreview.upload_history_count}</p>
+                <p class="text-xs text-gray-500 dark:text-gray-400">Upload Records</p>
+              </div>
+            </div>
+            
+            <div class="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg">
+              <p class="text-sm text-amber-700 dark:text-amber-400">
+                ⚠️ This will replace your current settings. Make sure you want to proceed.
+              </p>
+            </div>
+          </div>
+          
+          <div class="flex gap-3 justify-end pt-2">
+            <button
+              on:click={closeMigrationDialogs}
+              disabled={migrationImporting}
+              class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              on:click={handleMigrationImport}
+              disabled={migrationImporting}
+              class="px-4 py-2 text-sm font-medium text-white bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400 rounded-lg transition-colors flex items-center gap-2"
+            >
+              {#if migrationImporting}
+                <svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Importing...
+              {:else}
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                </svg>
+                Import & Restore
+              {/if}
+            </button>
+          </div>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}

@@ -3,11 +3,13 @@ mod db;
 mod utils;
 mod upload;
 mod crypto;
+mod migration;
 
 use r2::R2Client;
 use r2::multipart::MultipartUpload;
 use db::Database;
 use upload::UploadManager;
+use migration::{BackupData, CredentialsBackup, SyncFolderBackup, SettingBackup, UploadHistoryBackup};
 use utils::{R2Object, R2Credentials, UploadProgress, UploadStatus};
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -1128,6 +1130,222 @@ async fn delete_temp_file(path: String) -> Result<(), String> {
         .map_err(|e| format!("Failed to delete temp file: {}", e))
 }
 
+/// Export full migration backup (encrypted with password)
+#[tauri::command]
+async fn export_migration_backup(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    file_path: String,
+    password: String,
+) -> Result<(), String> {
+    if password.len() < 6 {
+        return Err("Password must be at least 6 characters".to_string());
+    }
+
+    let app_state = state.lock().await;
+    
+    // Load credentials
+    let credentials = match app_state.db.load_credentials().await {
+        Ok(Some((bucket, account_id, access_key_id, secret_access_key, endpoint))) => {
+            Some(CredentialsBackup {
+                bucket_name: bucket,
+                account_id,
+                access_key_id,
+                secret_access_key,
+                endpoint,
+            })
+        }
+        Ok(None) => None,
+        Err(e) => return Err(format!("Failed to load credentials: {}", e)),
+    };
+    
+    // Load sync folders
+    let sync_folders_data = app_state.db.get_sync_folders()
+        .await
+        .map_err(|e| format!("Failed to load sync folders: {}", e))?;
+    
+    let sync_folders: Vec<SyncFolderBackup> = sync_folders_data
+        .into_iter()
+        .map(|f| SyncFolderBackup {
+            local_path: f.local_path,
+            remote_path: f.remote_path,
+            sync_mode: "upload_only".to_string(),
+            enabled: f.enabled,
+        })
+        .collect();
+    
+    // Load settings from database
+    let settings: Vec<SettingBackup> = sqlx::query_as::<_, (String, String)>(
+        "SELECT key, value FROM settings"
+    )
+    .fetch_all(app_state.db.pool())
+    .await
+    .map_err(|e| format!("Failed to load settings: {}", e))?
+    .into_iter()
+    .map(|(key, value)| SettingBackup { key, value })
+    .collect();
+    
+    // Load completed upload history
+    let upload_history: Vec<UploadHistoryBackup> = sqlx::query_as::<_, (String, String, i64, String, Option<String>)>(
+        "SELECT file_path, remote_path, total_size, status, completed_at 
+         FROM uploads 
+         WHERE status = 'completed' 
+         ORDER BY completed_at DESC 
+         LIMIT 1000"
+    )
+    .fetch_all(app_state.db.pool())
+    .await
+    .map_err(|e| format!("Failed to load upload history: {}", e))?
+    .into_iter()
+    .map(|(file_path, remote_path, total_size, status, completed_at)| {
+        UploadHistoryBackup {
+            file_path,
+            remote_path,
+            total_size,
+            status,
+            completed_at,
+        }
+    })
+    .collect();
+    
+    // Create backup data
+    let backup = BackupData {
+        version: 1,
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        credentials,
+        sync_folders,
+        settings,
+        upload_history,
+    };
+    
+    // Encrypt and write to file
+    let encrypted = migration::encrypt_backup(&backup, &password)
+        .map_err(|e| format!("Failed to encrypt backup: {}", e))?;
+    
+    tokio::fs::write(&file_path, encrypted)
+        .await
+        .map_err(|e| format!("Failed to write backup file: {}", e))?;
+    
+    Ok(())
+}
+
+/// Import migration backup (decrypt with password)
+#[tauri::command]
+async fn import_migration_backup(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    file_path: String,
+    password: String,
+) -> Result<MigrationImportResult, String> {
+    // Read encrypted file
+    let encrypted = tokio::fs::read(&file_path)
+        .await
+        .map_err(|e| format!("Failed to read backup file: {}", e))?;
+    
+    // Decrypt
+    let backup = migration::decrypt_backup(&encrypted, &password)
+        .map_err(|e| e.to_string())?;
+    
+    let app_state = state.lock().await;
+    let mut result = MigrationImportResult {
+        credentials_imported: false,
+        sync_folders_imported: 0,
+        settings_imported: 0,
+        upload_history_imported: 0,
+    };
+    
+    // Import credentials
+    if let Some(creds) = backup.credentials {
+        app_state.db.save_credentials(
+            &creds.bucket_name,
+            &creds.account_id,
+            &creds.access_key_id,
+            &creds.secret_access_key,
+            &creds.endpoint,
+        )
+        .await
+        .map_err(|e| format!("Failed to import credentials: {}", e))?;
+        result.credentials_imported = true;
+    }
+    
+    // Import sync folders
+    for folder in backup.sync_folders {
+        match app_state.db.add_sync_folder(&folder.local_path, &folder.remote_path).await {
+            Ok(_) => result.sync_folders_imported += 1,
+            Err(e) => eprintln!("Failed to import sync folder {}: {}", folder.local_path, e),
+        }
+    }
+    
+    // Import settings
+    for setting in backup.settings {
+        match sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?) 
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        )
+        .bind(&setting.key)
+        .bind(&setting.value)
+        .execute(app_state.db.pool())
+        .await {
+            Ok(_) => result.settings_imported += 1,
+            Err(e) => eprintln!("Failed to import setting {}: {}", setting.key, e),
+        }
+    }
+    
+    // Note: We don't import upload history by default as paths may differ on new machine
+    // But we track what was available
+    result.upload_history_imported = backup.upload_history.len() as i32;
+    
+    Ok(result)
+}
+
+/// Result of migration import
+#[derive(serde::Serialize)]
+struct MigrationImportResult {
+    credentials_imported: bool,
+    sync_folders_imported: i32,
+    settings_imported: i32,
+    upload_history_imported: i32,
+}
+
+/// Preview what's in a migration backup without importing
+#[tauri::command]
+async fn preview_migration_backup(
+    file_path: String,
+    password: String,
+) -> Result<MigrationPreview, String> {
+    // Read encrypted file
+    let encrypted = tokio::fs::read(&file_path)
+        .await
+        .map_err(|e| format!("Failed to read backup file: {}", e))?;
+    
+    // Decrypt
+    let backup = migration::decrypt_backup(&encrypted, &password)
+        .map_err(|e| e.to_string())?;
+    
+    Ok(MigrationPreview {
+        version: backup.version,
+        app_version: backup.app_version,
+        created_at: backup.created_at,
+        has_credentials: backup.credentials.is_some(),
+        bucket_name: backup.credentials.as_ref().map(|c| c.bucket_name.clone()),
+        sync_folders_count: backup.sync_folders.len() as i32,
+        settings_count: backup.settings.len() as i32,
+        upload_history_count: backup.upload_history.len() as i32,
+    })
+}
+
+/// Preview of migration backup contents
+#[derive(serde::Serialize)]
+struct MigrationPreview {
+    version: u32,
+    app_version: String,
+    created_at: String,
+    has_credentials: bool,
+    bucket_name: Option<String>,
+    sync_folders_count: i32,
+    settings_count: i32,
+    upload_history_count: i32,
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1178,6 +1396,9 @@ pub fn run() {
             delete_temp_file,
             export_config,
             import_config,
+            export_migration_backup,
+            import_migration_backup,
+            preview_migration_backup,
             get_sync_folders,
             add_sync_folder,
             remove_sync_folder,
