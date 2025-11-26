@@ -67,3 +67,24 @@ export interface AppSettings {
   conflictResolution: 'ask' | 'local' | 'remote' | 'newest';
   notifications: boolean;
 }
+
+export interface ConnectionStatus {
+  connected: boolean;
+  bucketName?: string;
+  objectCount?: number;
+  error?: string;
+}
+
+export interface DownloadProgress {
+  id: string;
+  fileName: string;
+  remotePath: string;
+  localPath: string;
+  totalSize: number;
+  downloadedSize: number;
+  progress: number;
+  speed: number;
+  eta: number;
+  status: 'pending' | 'downloading' | 'paused' | 'completed' | 'failed' | 'cancelled';
+  errorMessage?: string;
+}

@@ -46,9 +46,10 @@ CREATE TABLE IF NOT EXISTS sync_folders (
     bucket_id INTEGER NOT NULL,
     local_path TEXT NOT NULL,
     remote_path TEXT NOT NULL,
-    sync_mode TEXT CHECK(sync_mode IN ('upload', 'download', 'bidirectional')) DEFAULT 'bidirectional',
+    sync_mode TEXT CHECK(sync_mode IN ('upload', 'download', 'bidirectional', 'upload_only')) DEFAULT 'upload_only',
     enabled BOOLEAN DEFAULT 1,
     last_sync DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (bucket_id) REFERENCES buckets(id) ON DELETE CASCADE
 );
 

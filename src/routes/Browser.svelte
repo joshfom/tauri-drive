@@ -9,6 +9,7 @@
   import { formatBytes, formatDate } from '../lib/utils/formatters';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import CreateFolderDialog from '../components/CreateFolderDialog.svelte';
+  import FilePreviewModal from '../components/FilePreviewModal.svelte';
 
   let objects: R2Object[] = [];
   let fileNodes: FileNode[] = [];
@@ -27,6 +28,10 @@
 
   // Create folder dialog state
   let showCreateFolderDialog = false;
+
+  // File preview state
+  let showPreviewModal = false;
+  let previewFile: FileNode | null = null;
 
   $: breadcrumbs = currentPath ? [{ name: 'Home', path: '' }, ...getBreadcrumbs(currentPath)] : [{ name: 'Home', path: '' }];
   $: fileNodes = parseObjectsIntoFolders(objects, currentPath);
@@ -159,27 +164,51 @@
     }
   }
 
+  function handlePreview(node: FileNode) {
+    if (node.isFolder) return;
+    previewFile = node;
+    showPreviewModal = true;
+  }
+
+  function closePreview() {
+    showPreviewModal = false;
+    previewFile = null;
+  }
+
   async function handleDownload(node: FileNode) {
-    if (node.isFolder) {
-      error = 'Folder download coming soon!';
-      return;
-    }
-
     try {
-      const savePath = await open({
-        directory: false,
-        multiple: false,
-        defaultPath: node.name,
-      });
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      
+      if (node.isFolder) {
+        // Download folder as zip
+        const savePath = await save({
+          defaultPath: `${node.name}.zip`,
+          filters: [{ name: 'ZIP Archive', extensions: ['zip'] }],
+        });
 
-      if (!savePath || Array.isArray(savePath)) return;
+        if (!savePath) return;
 
-      await invoke('download_file', {
-        remoteKey: node.path,
-        localPath: savePath,
-      });
+        await invoke('download_folder_as_zip', {
+          folderPath: node.path,
+          localPath: savePath,
+        });
 
-      alert('Download completed!');
+        alert('Folder download completed!');
+      } else {
+        // Download single file
+        const savePath = await save({
+          defaultPath: node.name,
+        });
+
+        if (!savePath) return;
+
+        await invoke('download_file_with_progress', {
+          remoteKey: node.path,
+          localPath: savePath,
+        });
+
+        alert('Download completed!');
+      }
     } catch (e) {
       error = `Download failed: ${e}`;
     }
@@ -261,67 +290,71 @@
   });
 </script>
 
-<div class="flex flex-col h-full bg-gradient-to-br from-gray-50 to-gray-100 dark:from-gray-900 dark:to-gray-800">
-  <!-- Header -->
-  <div class="bg-white/80 dark:bg-gray-800/80 backdrop-blur-sm border-b border-gray-200/50 dark:border-gray-700/50 px-8 py-6 shadow-sm">
+<div class="flex flex-col h-full bg-white dark:bg-gray-900">
+  <!-- Header - Flat design -->
+  <div class="border-b border-gray-200 dark:border-gray-800 px-6 py-4">
     <div class="flex items-center justify-between">
-      <div>
-        <h2 class="text-3xl font-bold text-gray-900 dark:text-white">File Browser</h2>
-        <!-- Breadcrumb navigation -->
-        <div class="flex items-center space-x-2 mt-2">
-          {#each breadcrumbs as crumb, i}
-            {#if i > 0}
-              <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
-              </svg>
-            {/if}
-            <button
-              on:click={() => navigateToFolder(crumb.path)}
-              class="text-sm font-medium {i === breadcrumbs.length - 1 ? 'text-blue-600 dark:text-blue-400' : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'}"
-            >
-              {crumb.name}
-            </button>
-          {/each}
-        </div>
+      <!-- Breadcrumb navigation -->
+      <div class="flex items-center gap-1">
+        {#each breadcrumbs as crumb, i}
+          {#if i > 0}
+            <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+            </svg>
+          {/if}
+          <button
+            on:click={() => navigateToFolder(crumb.path)}
+            class="px-2 py-1 text-sm font-medium rounded-lg transition-colors {i === breadcrumbs.length - 1 ? 'text-gray-900 dark:text-white bg-gray-100 dark:bg-gray-800' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'}"
+          >
+            {crumb.name}
+          </button>
+        {/each}
       </div>
-      <div class="flex space-x-3">
+      
+      <!-- Actions -->
+      <div class="flex items-center gap-2">
         <button
           on:click={loadObjects}
-          class="px-5 py-2.5 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 border border-gray-300 dark:border-gray-600 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-600 transition-all duration-200 flex items-center space-x-2 shadow-sm hover:shadow"
+          class="p-2 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-full transition-colors"
+          title="Refresh"
         >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
           </svg>
-          <span>Refresh</span>
         </button>
+        
+        <div class="h-6 w-px bg-gray-200 dark:bg-gray-700"></div>
+        
         <button
           on:click={() => showCreateFolderDialog = true}
-          class="px-5 py-2.5 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 border border-gray-300 dark:border-gray-600 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-600 transition-all duration-200 flex items-center space-x-2 shadow-sm hover:shadow"
+          class="flex items-center gap-2 px-3 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
         >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 13h6m-3-3v6m-9 1V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/>
           </svg>
-          <span>New Folder</span>
+          <span>New folder</span>
         </button>
+        
         <button
           on:click={handleUploadFolder}
           disabled={uploading}
-          class="px-5 py-2.5 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 border border-gray-300 dark:border-gray-600 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 flex items-center space-x-2 shadow-sm hover:shadow"
+          class="flex items-center gap-2 px-3 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors disabled:opacity-50"
         >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
           </svg>
-          <span>Upload Folder</span>
+          <span>Upload folder</span>
         </button>
+        
         <button
           on:click={handleUploadFiles}
           disabled={uploading}
-          class="px-6 py-2.5 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-xl hover:from-blue-700 hover:to-blue-800 disabled:from-gray-400 disabled:to-gray-500 disabled:cursor-not-allowed transition-all duration-200 flex items-center space-x-2 shadow-lg hover:shadow-xl transform hover:-translate-y-0.5"
+          class="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50"
         >
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
           </svg>
-          <span>{uploading ? 'Uploading...' : 'Upload Files'}</span>
+          <span>{uploading ? 'Uploading...' : 'Upload'}</span>
         </button>
       </div>
     </div>
@@ -331,7 +364,7 @@
   <div 
     role="region"
     aria-label="File drop zone"
-    class="flex-1 overflow-auto p-8"
+    class="flex-1 overflow-auto p-6"
     on:dragenter={handleDragEnter}
     on:dragleave={handleDragLeave}
     on:dragover={handleDragOver}
@@ -339,142 +372,165 @@
   >
     <!-- Drag overlay -->
     {#if isDragging}
-      <div class="fixed inset-0 bg-blue-500/20 backdrop-blur-sm z-40 flex items-center justify-center">
-        <div class="bg-white dark:bg-gray-800 rounded-2xl p-8 shadow-2xl border-4 border-dashed border-blue-500">
-          <svg class="w-16 h-16 text-blue-600 dark:text-blue-400 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <div class="fixed inset-0 bg-blue-500/10 z-40 flex items-center justify-center">
+        <div class="bg-white dark:bg-gray-800 rounded-xl p-8 border-2 border-dashed border-blue-500">
+          <svg class="w-12 h-12 text-blue-600 dark:text-blue-400 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
           </svg>
-          <p class="mt-4 text-xl font-semibold text-gray-900 dark:text-white">Drop files here to upload</p>
+          <p class="mt-4 text-lg font-medium text-gray-900 dark:text-white">Drop files here to upload</p>
         </div>
       </div>
     {/if}
 
     {#if loading}
-      <div class="flex items-center justify-center h-96">
+      <div class="flex items-center justify-center h-64">
         <div class="text-center">
-          <div class="animate-spin rounded-full h-16 w-16 border-4 border-blue-200 border-t-blue-600 mx-auto"></div>
-          <p class="mt-4 text-gray-600 dark:text-gray-400">Loading files...</p>
+          <div class="animate-spin rounded-full h-10 w-10 border-2 border-gray-200 border-t-blue-600 mx-auto"></div>
+          <p class="mt-3 text-sm text-gray-500 dark:text-gray-400">Loading files...</p>
         </div>
       </div>
     {:else if error}
-      <div class="max-w-2xl mx-auto mt-8">
-        <div class="bg-gradient-to-r from-red-50 to-red-100 dark:from-red-900/20 dark:to-red-800/20 border-l-4 border-red-500 rounded-xl p-6 shadow-lg">
-          <div class="flex items-start">
-            <svg class="w-6 h-6 text-red-600 dark:text-red-400 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <div class="max-w-md mx-auto mt-8">
+        <div class="bg-red-50 dark:bg-red-900/10 border border-red-200 dark:border-red-800 rounded-lg p-4">
+          <div class="flex items-start gap-3">
+            <svg class="w-5 h-5 text-red-600 dark:text-red-400 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
             </svg>
-            <div class="ml-4">
-              <h3 class="text-lg font-semibold text-red-800 dark:text-red-200">Error</h3>
-              <p class="text-red-700 dark:text-red-300 mt-2">{error}</p>
+            <div>
+              <h3 class="text-sm font-medium text-red-800 dark:text-red-200">Error</h3>
+              <p class="text-sm text-red-700 dark:text-red-300 mt-1">{error}</p>
             </div>
           </div>
         </div>
       </div>
     {:else if fileNodes.length === 0}
-      <div class="flex items-center justify-center h-96">
+      <div class="flex items-center justify-center h-64">
         <div class="text-center">
-          <div class="mx-auto w-32 h-32 bg-gradient-to-br from-blue-100 to-blue-200 dark:from-blue-900/30 dark:to-blue-800/30 rounded-3xl flex items-center justify-center shadow-xl">
-            <svg class="w-16 h-16 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
+          <div class="mx-auto w-20 h-20 bg-gray-100 dark:bg-gray-800 rounded-full flex items-center justify-center">
+            <svg class="w-10 h-10 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
             </svg>
           </div>
-          <h3 class="mt-6 text-xl font-semibold text-gray-900 dark:text-white">This folder is empty</h3>
-          <p class="mt-2 text-gray-500 dark:text-gray-400">Upload files or folders to get started</p>
-          <div class="mt-6 flex gap-3 justify-center">
+          <h3 class="mt-4 text-lg font-medium text-gray-900 dark:text-white">This folder is empty</h3>
+          <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">Upload files or create a folder to get started</p>
+          <div class="mt-4 flex gap-2 justify-center">
             <button
               on:click={handleUploadFiles}
-              class="px-6 py-3 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-xl hover:from-blue-700 hover:to-blue-800 transition-all duration-200 shadow-lg hover:shadow-xl transform hover:-translate-y-0.5"
+              class="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors"
             >
-              Upload Files
+              Upload files
             </button>
             <button
               on:click={handleUploadFolder}
-              class="px-6 py-3 bg-gradient-to-r from-purple-600 to-purple-700 text-white rounded-xl hover:from-purple-700 hover:to-purple-800 transition-all duration-200 shadow-lg hover:shadow-xl transform hover:-translate-y-0.5"
+              class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800 rounded-lg transition-colors"
             >
-              Upload Folder
+              Upload folder
             </button>
           </div>
         </div>
       </div>
     {:else}
-      <div class="bg-white/80 dark:bg-gray-800/80 backdrop-blur-sm shadow-xl rounded-2xl overflow-hidden border border-gray-200/50 dark:border-gray-700/50">
-        <div class="overflow-x-auto">
-          <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-            <thead class="bg-gradient-to-r from-gray-50 to-gray-100 dark:from-gray-700 dark:to-gray-800">
-              <tr>
-                <th class="px-6 py-4 text-left text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
-                  Name
-                </th>
-                <th class="px-6 py-4 text-left text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
-                  Size
-                </th>
-                <th class="px-6 py-4 text-left text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
-                  Last Modified
-                </th>
-                <th class="px-6 py-4 text-right text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
-                  Actions
-                </th>
-              </tr>
-            </thead>
-            <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200/50 dark:divide-gray-700/50">
-              {#each fileNodes as node}
-                <tr 
-                  class="hover:bg-blue-50/50 dark:hover:bg-blue-900/10 transition-colors duration-150 {node.isFolder ? 'cursor-pointer' : ''}"
-                  on:dblclick={() => node.isFolder && navigateToFolder(node.path)}
+      <!-- Grid view like Google Drive -->
+      <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
+        {#each fileNodes as node}
+          <div
+            role="button"
+            tabindex="0"
+            class="group relative bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl p-3 hover:border-blue-500 dark:hover:border-blue-500 transition-colors cursor-pointer text-left w-full focus:outline-none focus:ring-2 focus:ring-blue-500"
+            on:dblclick={() => node.isFolder ? navigateToFolder(node.path) : handlePreview(node)}
+            on:keydown={(e) => e.key === 'Enter' && (node.isFolder ? navigateToFolder(node.path) : handlePreview(node))}
+          >
+            <!-- File/Folder icon -->
+            <div class="aspect-square rounded-lg bg-gray-50 dark:bg-gray-900 flex items-center justify-center mb-3">
+              {#if node.isFolder}
+                <svg class="w-16 h-16 text-amber-500" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M10 4H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V8a2 2 0 00-2-2h-8l-2-2z"/>
+                </svg>
+              {:else}
+                {@const ext = node.name.split('.').pop()?.toLowerCase() || ''}
+                {#if ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp'].includes(ext)}
+                  <svg class="w-16 h-16 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+                  </svg>
+                {:else if ['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext)}
+                  <svg class="w-16 h-16 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                  </svg>
+                {:else if ['mp3', 'wav', 'flac', 'aac', 'ogg'].includes(ext)}
+                  <svg class="w-16 h-16 text-pink-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"/>
+                  </svg>
+                {:else if ['pdf'].includes(ext)}
+                  <svg class="w-16 h-16 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/>
+                  </svg>
+                {:else if ['doc', 'docx', 'txt', 'rtf'].includes(ext)}
+                  <svg class="w-16 h-16 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                  </svg>
+                {:else if ['xls', 'xlsx', 'csv'].includes(ext)}
+                  <svg class="w-16 h-16 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                  </svg>
+                {:else if ['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)}
+                  <svg class="w-16 h-16 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4"/>
+                  </svg>
+                {:else}
+                  <svg class="w-16 h-16 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                  </svg>
+                {/if}
+              {/if}
+            </div>
+            
+            <!-- File info -->
+            <div class="min-w-0">
+              <p class="text-sm font-medium text-gray-900 dark:text-white truncate" title={node.name}>
+                {node.name}
+              </p>
+              <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                {node.isFolder ? `${node.children?.length || 0} items` : formatBytes(node.size)}
+              </p>
+            </div>
+            
+            <!-- Action menu on hover -->
+            <div class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
+              <div class="flex items-center gap-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-1">
+                {#if !node.isFolder}
+                  <button
+                    on:click|stopPropagation={() => handlePreview(node)}
+                    class="p-1.5 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
+                    title="Preview"
+                  >
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+                    </svg>
+                  </button>
+                {/if}
+                <button
+                  on:click|stopPropagation={() => handleDownload(node)}
+                  class="p-1.5 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
+                  title={node.isFolder ? 'Download as ZIP' : 'Download'}
                 >
-                  <td class="px-6 py-4 whitespace-nowrap">
-                    <div class="flex items-center">
-                      <div class="w-10 h-10 bg-gradient-to-br {node.isFolder ? 'from-yellow-100 to-amber-200 dark:from-yellow-900/40 dark:to-amber-800/40' : 'from-blue-100 to-blue-200 dark:from-blue-900/40 dark:to-blue-800/40'} rounded-xl flex items-center justify-center mr-3">
-                        {#if node.isFolder}
-                          <svg class="h-5 w-5 text-yellow-600 dark:text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
-                          </svg>
-                        {:else}
-                          <svg class="h-5 w-5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
-                          </svg>
-                        {/if}
-                      </div>
-                      <span class="text-sm font-medium text-gray-900 dark:text-white">{node.name}</span>
-                    </div>
-                  </td>
-                  <td class="px-6 py-4 whitespace-nowrap">
-                    <span class="text-sm text-gray-600 dark:text-gray-400 font-medium">
-                      {node.isFolder ? `${node.children?.length || 0} items` : formatBytes(node.size)}
-                    </span>
-                  </td>
-                  <td class="px-6 py-4 whitespace-nowrap">
-                    <span class="text-sm text-gray-600 dark:text-gray-400">
-                      {formatDate(node.lastModified)}
-                    </span>
-                  </td>
-                  <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                    {#if !node.isFolder}
-                      <button
-                        on:click={() => handleDownload(node)}
-                        class="inline-flex items-center px-3 py-1.5 bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 rounded-lg hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors duration-150 mr-2"
-                      >
-                        <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
-                        </svg>
-                        Download
-                      </button>
-                    {/if}
-                    <button
-                      on:click={() => handleDelete(node)}
-                      class="inline-flex items-center px-3 py-1.5 bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 rounded-lg hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors duration-150"
-                    >
-                      <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
-                      </svg>
-                      Delete
-                    </button>
-                  </td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+                  </svg>
+                </button>
+                <button
+                  on:click|stopPropagation={() => handleDelete(node)}
+                  class="p-1.5 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 rounded"
+                  title="Delete"
+                >
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        {/each}
       </div>
     {/if}
   </div>
@@ -498,4 +554,11 @@
   currentPath={currentPath}
   onConfirm={handleCreateFolder}
   onCancel={() => {}}
+/>
+
+<!-- File Preview Modal -->
+<FilePreviewModal
+  bind:isOpen={showPreviewModal}
+  file={previewFile}
+  onClose={closePreview}
 />

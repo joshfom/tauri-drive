@@ -2,6 +2,7 @@ mod r2;
 mod db;
 mod utils;
 mod upload;
+mod crypto;
 
 use r2::R2Client;
 use db::Database;
@@ -67,6 +68,21 @@ async fn connect_r2(
     *app_state.r2_client.lock().await = Some(client);
 
     Ok("Connected successfully! Connection verified by listing objects.".to_string())
+}
+
+#[tauri::command]
+async fn get_current_credentials(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Option<(String, String, String, String)>, String> {
+    let app_state = state.lock().await;
+    let creds = app_state.db.load_credentials()
+        .await
+        .map_err(|e| format!("Failed to load credentials: {}", e))?;
+    
+    // Return (bucket_name, account_id, access_key_id, secret_access_key)
+    Ok(creds.map(|(name, account_id, access_key_id, secret_access_key, _endpoint)| {
+        (name, account_id, access_key_id, secret_access_key)
+    }))
 }
 
 #[tauri::command]
@@ -199,16 +215,311 @@ async fn download_file(
         .as_ref()
         .ok_or("Not connected to R2")?;
 
-    r2::operations::get_object(
+    r2::operations::get_object_streaming(
         client.client(),
         client.bucket(),
         &remote_key,
         &local_path,
+        None,
     )
     .await
     .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// Download progress info sent to frontend
+#[derive(Clone, serde::Serialize)]
+struct DownloadProgress {
+    id: String,
+    file_name: String,
+    remote_path: String,
+    local_path: String,
+    total_size: i64,
+    downloaded_size: i64,
+    progress: f64,
+    speed: f64,
+    eta: i64,
+    status: String,
+    error_message: Option<String>,
+}
+
+#[tauri::command]
+async fn download_file_with_progress(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    remote_key: String,
+    local_path: String,
+) -> Result<String, String> {
+    let download_id = uuid::Uuid::new_v4().to_string();
+    
+    let (client_clone, bucket_clone) = {
+        let app_state = state.lock().await;
+        let client_guard = app_state.r2_client.lock().await;
+        
+        let client = client_guard
+            .as_ref()
+            .ok_or("Not connected to R2")?;
+        
+        (client.client().clone(), client.bucket().to_string())
+    };
+
+    let file_name = remote_key.split('/').last().unwrap_or(&remote_key).to_string();
+    
+    // Emit initial progress
+    let initial_progress = DownloadProgress {
+        id: download_id.clone(),
+        file_name: file_name.clone(),
+        remote_path: remote_key.clone(),
+        local_path: local_path.clone(),
+        total_size: 0,
+        downloaded_size: 0,
+        progress: 0.0,
+        speed: 0.0,
+        eta: 0,
+        status: "downloading".to_string(),
+        error_message: None,
+    };
+    app.emit("download-progress", &initial_progress).ok();
+
+    // Clone for closure
+    let app_clone = app.clone();
+    let download_id_clone = download_id.clone();
+    let file_name_clone = file_name.clone();
+    let remote_key_clone = remote_key.clone();
+    let local_path_clone = local_path.clone();
+
+    let progress_callback: r2::operations::DownloadProgressCallback = Box::new(move |downloaded, total, speed, eta| {
+        let progress_pct = if total > 0 { (downloaded as f64 / total as f64) * 100.0 } else { 0.0 };
+        let progress_event = DownloadProgress {
+            id: download_id_clone.clone(),
+            file_name: file_name_clone.clone(),
+            remote_path: remote_key_clone.clone(),
+            local_path: local_path_clone.clone(),
+            total_size: total,
+            downloaded_size: downloaded,
+            progress: progress_pct,
+            speed,
+            eta,
+            status: "downloading".to_string(),
+            error_message: None,
+        };
+        app_clone.emit("download-progress", &progress_event).ok();
+    });
+
+    r2::operations::get_object_streaming(
+        &client_clone,
+        &bucket_clone,
+        &remote_key,
+        &local_path,
+        Some(progress_callback),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Emit completion
+    let complete_progress = DownloadProgress {
+        id: download_id.clone(),
+        file_name,
+        remote_path: remote_key,
+        local_path,
+        total_size: 0,
+        downloaded_size: 0,
+        progress: 100.0,
+        speed: 0.0,
+        eta: 0,
+        status: "completed".to_string(),
+        error_message: None,
+    };
+    app.emit("download-progress", &complete_progress).ok();
+
+    Ok(download_id)
+}
+
+/// Download a folder as a zip file
+#[tauri::command]
+async fn download_folder_as_zip(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    folder_path: String,
+    local_path: String,
+) -> Result<String, String> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    
+    let download_id = uuid::Uuid::new_v4().to_string();
+    
+    // Get client info
+    let (client_clone, bucket_clone) = {
+        let app_state = state.lock().await;
+        let client_guard = app_state.r2_client.lock().await;
+        
+        let client = client_guard
+            .as_ref()
+            .ok_or("Not connected to R2")?;
+        
+        (client.client().clone(), client.bucket().to_string())
+    };
+
+    // List all files in the folder
+    let prefix = if folder_path.ends_with('/') {
+        folder_path.clone()
+    } else {
+        format!("{}/", folder_path)
+    };
+    
+    let objects = r2::operations::list_objects(&client_clone, &bucket_clone, Some(&prefix))
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    // Filter to only files (not empty folder markers)
+    let files: Vec<_> = objects.iter()
+        .filter(|o| !o.key.ends_with('/') && o.size > 0)
+        .collect();
+    
+    if files.is_empty() {
+        return Err("Folder is empty or contains no files".to_string());
+    }
+    
+    let folder_name = folder_path.split('/').filter(|s| !s.is_empty()).last().unwrap_or("folder");
+    let total_files = files.len();
+    let total_size: i64 = files.iter().map(|f| f.size).sum();
+    
+    // Emit initial progress
+    let initial_progress = DownloadProgress {
+        id: download_id.clone(),
+        file_name: format!("{}.zip", folder_name),
+        remote_path: folder_path.clone(),
+        local_path: local_path.clone(),
+        total_size,
+        downloaded_size: 0,
+        progress: 0.0,
+        speed: 0.0,
+        eta: 0,
+        status: "downloading".to_string(),
+        error_message: None,
+    };
+    app.emit("download-progress", &initial_progress).ok();
+    
+    // Create zip file
+    let zip_file = std::fs::File::create(&local_path)
+        .map_err(|e| format!("Failed to create zip file: {}", e))?;
+    let mut zip = zip::ZipWriter::new(zip_file);
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    
+    let mut downloaded_size: i64 = 0;
+    let start_time = std::time::Instant::now();
+    
+    for (i, file) in files.iter().enumerate() {
+        // Get the relative path within the folder
+        let relative_path = file.key.strip_prefix(&prefix).unwrap_or(&file.key);
+        
+        // Download file content
+        let response = client_clone
+            .get_object()
+            .bucket(&bucket_clone)
+            .key(&file.key)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to download {}: {}", file.key, e))?;
+        
+        let data = response.body
+            .collect()
+            .await
+            .map_err(|e| format!("Failed to read file data: {}", e))?
+            .into_bytes();
+        
+        // Add to zip
+        zip.start_file(relative_path, options)
+            .map_err(|e| format!("Failed to add file to zip: {}", e))?;
+        zip.write_all(&data)
+            .map_err(|e| format!("Failed to write file to zip: {}", e))?;
+        
+        downloaded_size += file.size;
+        
+        // Calculate progress
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 { downloaded_size as f64 / elapsed } else { 0.0 };
+        let remaining = total_size - downloaded_size;
+        let eta = if speed > 0.0 { (remaining as f64 / speed) as i64 } else { 0 };
+        let progress_pct = (downloaded_size as f64 / total_size as f64) * 100.0;
+        
+        let progress_event = DownloadProgress {
+            id: download_id.clone(),
+            file_name: format!("{}.zip ({}/{})", folder_name, i + 1, total_files),
+            remote_path: folder_path.clone(),
+            local_path: local_path.clone(),
+            total_size,
+            downloaded_size,
+            progress: progress_pct,
+            speed,
+            eta,
+            status: "downloading".to_string(),
+            error_message: None,
+        };
+        app.emit("download-progress", &progress_event).ok();
+    }
+    
+    // Finalize zip
+    zip.finish().map_err(|e| format!("Failed to finalize zip: {}", e))?;
+    
+    // Emit completion
+    let complete_progress = DownloadProgress {
+        id: download_id.clone(),
+        file_name: format!("{}.zip", folder_name),
+        remote_path: folder_path,
+        local_path,
+        total_size,
+        downloaded_size: total_size,
+        progress: 100.0,
+        speed: 0.0,
+        eta: 0,
+        status: "completed".to_string(),
+        error_message: None,
+    };
+    app.emit("download-progress", &complete_progress).ok();
+
+    Ok(download_id)
+}
+
+/// Check if currently connected to R2
+#[tauri::command]
+async fn check_connection(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<ConnectionStatus, String> {
+    let app_state = state.lock().await;
+    let client_guard = app_state.r2_client.lock().await;
+    
+    match client_guard.as_ref() {
+        Some(client) => {
+            // Try to list objects to verify connection is still valid
+            match r2::operations::list_objects(client.client(), client.bucket(), None).await {
+                Ok(_) => Ok(ConnectionStatus {
+                    connected: true,
+                    bucket: Some(client.bucket().to_string()),
+                    error: None,
+                }),
+                Err(e) => Ok(ConnectionStatus {
+                    connected: false,
+                    bucket: Some(client.bucket().to_string()),
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
+        None => Ok(ConnectionStatus {
+            connected: false,
+            bucket: None,
+            error: None,
+        }),
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ConnectionStatus {
+    connected: bool,
+    bucket: Option<String>,
+    error: Option<String>,
 }
 
 #[tauri::command]
@@ -253,37 +564,51 @@ async fn upload_file_with_progress(
     local_path: String,
     remote_key: String,
 ) -> Result<String, String> {
-    let app_state = state.lock().await;
-    let client_guard = app_state.r2_client.lock().await;
-    
-    let client = client_guard
-        .as_ref()
-        .ok_or("Not connected to R2")?;
+    // Clone what we need before the async block
+    let (client_clone, bucket_clone, upload_id, file_size, file_name, upload_manager) = {
+        let app_state = state.lock().await;
+        let client_guard = app_state.r2_client.lock().await;
+        
+        let client = client_guard
+            .as_ref()
+            .ok_or("Not connected to R2")?;
 
-    // Get file size
-    let metadata = tokio::fs::metadata(&local_path)
-        .await
-        .map_err(|e| e.to_string())?;
-    let file_size = metadata.len() as i64;
+        // Get file size
+        let metadata = tokio::fs::metadata(&local_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        let file_size = metadata.len() as i64;
 
-    // Create upload record
-    let upload_id = app_state.upload_manager
-        .create_upload(1, &local_path, &remote_key, file_size, 10 * 1024 * 1024)
-        .await
-        .map_err(|e| e.to_string())?;
+        // Create upload record
+        let upload_id = app_state.upload_manager
+            .create_upload(1, &local_path, &remote_key, file_size, 10 * 1024 * 1024)
+            .await
+            .map_err(|e| e.to_string())?;
 
-    // Update status to uploading
-    app_state.upload_manager
-        .update_upload_status(&upload_id, "uploading", None, None)
-        .await
-        .map_err(|e| e.to_string())?;
+        // Update status to uploading
+        app_state.upload_manager
+            .update_upload_status(&upload_id, "uploading", None, None)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Get file name
+        let file_name = std::path::Path::new(&local_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        (
+            client.client().clone(),
+            client.bucket().to_string(),
+            upload_id,
+            file_size,
+            file_name,
+            app_state.upload_manager.clone(),
+        )
+    };
 
     // Emit initial progress event
-    let file_name = std::path::Path::new(&local_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
     let progress = UploadProgress {
         id: upload_id.clone(),
         file_name: file_name.clone(),
@@ -298,10 +623,6 @@ async fn upload_file_with_progress(
         error_message: None,
     };
     app.emit("upload-progress", &progress).ok();
-    app_state.upload_manager
-        .update_upload_status(&upload_id, "uploading", None, None)
-        .await
-        .map_err(|e| e.to_string())?;
 
     // Clone variables for closure
     let upload_id_clone = upload_id.clone();
@@ -309,31 +630,32 @@ async fn upload_file_with_progress(
     let local_path_clone = local_path.clone();
     let remote_key_clone = remote_key.clone();
 
-    // Use multipart upload for files > 100MB
+    // Use multipart upload for files > 100MB (with 8 concurrent uploads)
     if file_size > 100 * 1024 * 1024 {
         let app_clone = app.clone();
         let upload = r2::multipart::MultipartUpload::new(
-            client.client().clone(),
-            client.bucket().to_string(),
+            client_clone.clone(),
+            bucket_clone.clone(),
             remote_key.clone(),
-            Some(10 * 1024 * 1024),
+            Some(10 * 1024 * 1024), // 10MB chunks
         )
         .await
         .map_err(|e| e.to_string())?;
 
+        // Use concurrent upload with speed/ETA tracking
         let parts = upload
-            .upload_file_with_progress(&local_path, |uploaded, total| {
-                let progress_pct = (uploaded as f64 / total as f64) * 100.0;
+            .upload_file_concurrent(&local_path, move |progress_info| {
+                let progress_pct = (progress_info.uploaded_bytes as f64 / progress_info.total_bytes as f64) * 100.0;
                 let progress_event = UploadProgress {
                     id: upload_id_clone.clone(),
                     file_name: file_name_clone.clone(),
                     file_path: local_path_clone.clone(),
                     remote_path: remote_key_clone.clone(),
-                    total_size: total,
-                    uploaded_size: uploaded,
+                    total_size: progress_info.total_bytes,
+                    uploaded_size: progress_info.uploaded_bytes,
                     progress: progress_pct,
-                    speed: 0.0,
-                    eta: 0,
+                    speed: progress_info.speed_bytes_per_sec,
+                    eta: progress_info.eta_seconds,
                     status: UploadStatus::Uploading,
                     error_message: None,
                 };
@@ -341,41 +663,56 @@ async fn upload_file_with_progress(
             })
             .await
             .map_err(|e| {
-                // Mark as failed
-                let upload_manager = app_state.upload_manager.clone();
+                // Mark as failed and abort upload
+                let um = upload_manager.clone();
                 let id = upload_id.clone();
                 let err_msg = e.to_string();
                 tauri::async_runtime::spawn(async move {
-                    upload_manager.update_upload_status(&id, "failed", None, Some(&err_msg)).await.ok();
+                    um.update_upload_status(&id, "failed", None, Some(&err_msg)).await.ok();
                 });
                 e.to_string()
             })?;
 
+        // Complete the multipart upload - CRITICAL step
         upload
             .complete(parts)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                let um = upload_manager.clone();
+                let id = upload_id.clone();
+                let err_msg = format!("Failed to complete multipart upload: {}", e);
+                tauri::async_runtime::spawn(async move {
+                    um.update_upload_status(&id, "failed", None, Some(&err_msg)).await.ok();
+                });
+                // Abort the upload on failure
+                let upload_ref = upload;
+                tauri::async_runtime::spawn(async move {
+                    upload_ref.abort().await.ok();
+                });
+                e.to_string()
+            })?;
     } else {
+        // For smaller files, use simple put_object
         r2::operations::put_object(
-            client.client(),
-            client.bucket(),
+            &client_clone,
+            &bucket_clone,
             &remote_key,
             &local_path,
         )
         .await
         .map_err(|e| {
-            let upload_manager = app_state.upload_manager.clone();
+            let um = upload_manager.clone();
             let id = upload_id.clone();
             let err_msg = e.to_string();
             tauri::async_runtime::spawn(async move {
-                upload_manager.update_upload_status(&id, "failed", None, Some(&err_msg)).await.ok();
+                um.update_upload_status(&id, "failed", None, Some(&err_msg)).await.ok();
             });
             e.to_string()
         })?;
     }
 
     // Mark as completed
-    app_state.upload_manager
+    upload_manager
         .update_upload_status(&upload_id, "completed", Some(file_size), None)
         .await
         .map_err(|e| e.to_string())?;
@@ -487,6 +824,180 @@ async fn list_directory(
     Ok(files)
 }
 
+/// Export configuration to a JSON file (credentials are encrypted)
+#[tauri::command]
+async fn export_config(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    file_path: String,
+) -> Result<(), String> {
+    use serde_json::json;
+    
+    let app_state = state.lock().await;
+    
+    // Load credentials from database
+    let creds = app_state.db.load_credentials()
+        .await
+        .map_err(|e| format!("Failed to load credentials: {}", e))?
+        .ok_or("No credentials to export")?;
+
+    let (bucket, account_id, access_key_id, secret_access_key, endpoint) = creds;
+    
+    // Get sync folders
+    let sync_folders = app_state.db.get_sync_folders()
+        .await
+        .map_err(|e| format!("Failed to load sync folders: {}", e))?;
+    
+    // Create config object
+    let config = json!({
+        "version": "1.0",
+        "credentials": {
+            "bucket": bucket,
+            "account_id": account_id,
+            "access_key_id": access_key_id,
+            "secret_access_key": secret_access_key,
+            "endpoint": endpoint
+        },
+        "sync_folders": sync_folders
+    });
+    
+    // Write to file
+    tokio::fs::write(&file_path, config.to_string())
+        .await
+        .map_err(|e| format!("Failed to write config file: {}", e))?;
+    
+    Ok(())
+}
+
+/// Import configuration from a JSON file
+#[tauri::command]
+async fn import_config(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    file_path: String,
+) -> Result<(), String> {
+    // Read file
+    let content = tokio::fs::read_to_string(&file_path)
+        .await
+        .map_err(|e| format!("Failed to read config file: {}", e))?;
+    
+    let config: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Invalid config file: {}", e))?;
+    
+    let app_state = state.lock().await;
+    
+    // Import credentials
+    if let Some(creds) = config.get("credentials") {
+        let bucket = creds.get("bucket")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing bucket")?;
+        let account_id = creds.get("account_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing account_id")?;
+        let access_key_id = creds.get("access_key_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing access_key_id")?;
+        let secret_access_key = creds.get("secret_access_key")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing secret_access_key")?;
+        let endpoint = creds.get("endpoint")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing endpoint")?;
+        
+        app_state.db.save_credentials(
+            bucket,
+            account_id,
+            access_key_id,
+            secret_access_key,
+            endpoint,
+        )
+        .await
+        .map_err(|e| format!("Failed to save credentials: {}", e))?;
+    }
+    
+    Ok(())
+}
+
+/// Sync folder data structure
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SyncFolder {
+    pub id: i64,
+    pub local_path: String,
+    pub remote_path: String,
+    pub enabled: bool,
+    pub last_sync: Option<String>,
+}
+
+/// Get all sync folders
+#[tauri::command]
+async fn get_sync_folders(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<SyncFolder>, String> {
+    let app_state = state.lock().await;
+    app_state.db.get_sync_folders()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Add a new sync folder
+#[tauri::command]
+async fn add_sync_folder(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    local_path: String,
+    remote_path: String,
+) -> Result<i64, String> {
+    let app_state = state.lock().await;
+    app_state.db.add_sync_folder(&local_path, &remote_path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Remove a sync folder
+#[tauri::command]
+async fn remove_sync_folder(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    folder_id: i64,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+    app_state.db.remove_sync_folder(folder_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Toggle sync folder enabled status
+#[tauri::command]
+async fn toggle_sync_folder(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    folder_id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+    app_state.db.toggle_sync_folder(folder_id, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Get temp directory path
+#[tauri::command]
+async fn get_temp_dir() -> Result<String, String> {
+    let temp_dir = std::env::temp_dir();
+    Ok(temp_dir.to_string_lossy().to_string())
+}
+
+/// Read text file content
+#[tauri::command]
+async fn read_text_file(path: String) -> Result<String, String> {
+    tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("Failed to read file: {}", e))
+}
+
+/// Delete temp file (cleanup after preview)
+#[tauri::command]
+async fn delete_temp_file(path: String) -> Result<(), String> {
+    tokio::fs::remove_file(&path)
+        .await
+        .map_err(|e| format!("Failed to delete temp file: {}", e))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -512,16 +1023,29 @@ pub fn run() {
             greet,
             connect_r2,
             get_saved_bucket,
+            get_current_credentials,
             load_and_connect,
             list_objects,
             upload_file,
             upload_file_with_progress,
             download_file,
+            download_file_with_progress,
+            download_folder_as_zip,
             delete_file,
             get_active_uploads,
             cancel_upload,
             create_folder,
             list_directory,
+            check_connection,
+            get_temp_dir,
+            read_text_file,
+            delete_temp_file,
+            export_config,
+            import_config,
+            get_sync_folders,
+            add_sync_folder,
+            remove_sync_folder,
+            toggle_sync_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
