@@ -181,3 +181,211 @@ impl Database {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    async fn setup_test_db() -> (Database, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = Database::new(Some(db_path)).await.unwrap();
+        (db, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_save_and_load_credentials() {
+        let (db, _temp_dir) = setup_test_db().await;
+        
+        // Save credentials
+        let result = db.save_credentials(
+            "test-bucket",
+            "account123",
+            "access_key_id",
+            "secret_access_key",
+            "https://test.r2.cloudflarestorage.com"
+        ).await;
+        
+        assert!(result.is_ok());
+        
+        // Load credentials
+        let loaded = db.load_credentials().await.unwrap();
+        assert!(loaded.is_some());
+        
+        let (bucket, account_id, access_key, secret_key, endpoint) = loaded.unwrap();
+        assert_eq!(bucket, "test-bucket");
+        assert_eq!(account_id, "account123");
+        assert_eq!(access_key, "access_key_id");
+        assert_eq!(secret_key, "secret_access_key");
+        assert_eq!(endpoint, "https://test.r2.cloudflarestorage.com");
+    }
+
+    #[tokio::test]
+    async fn test_update_credentials() {
+        let (db, _temp_dir) = setup_test_db().await;
+        
+        // Save initial credentials
+        db.save_credentials(
+            "bucket1",
+            "account1",
+            "key1",
+            "secret1",
+            "https://endpoint1.com"
+        ).await.unwrap();
+        
+        // Update with same bucket name (UPSERT)
+        db.save_credentials(
+            "bucket1",
+            "account2",
+            "key2",
+            "secret2",
+            "https://endpoint2.com"
+        ).await.unwrap();
+        
+        // Should have updated, not inserted
+        let loaded = db.load_credentials().await.unwrap().unwrap();
+        assert_eq!(loaded.1, "account2");
+        assert_eq!(loaded.2, "key2");
+    }
+
+    #[tokio::test]
+    async fn test_get_current_bucket() {
+        let (db, _temp_dir) = setup_test_db().await;
+        
+        // No bucket initially
+        let bucket = db.get_current_bucket().await.unwrap();
+        assert!(bucket.is_none());
+        
+        // Add a bucket
+        db.save_credentials(
+            "my-bucket",
+            "account",
+            "key",
+            "secret",
+            "https://endpoint.com"
+        ).await.unwrap();
+        
+        let bucket = db.get_current_bucket().await.unwrap();
+        assert_eq!(bucket, Some("my-bucket".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_sync_folders_crud() {
+        let (db, _temp_dir) = setup_test_db().await;
+        
+        // First add a bucket (required for sync folders)
+        db.save_credentials(
+            "bucket",
+            "account",
+            "key",
+            "secret",
+            "https://endpoint.com"
+        ).await.unwrap();
+        
+        // Add sync folder
+        let folder_id = db.add_sync_folder(
+            "/home/user/documents",
+            "documents/"
+        ).await.unwrap();
+        
+        assert!(folder_id > 0);
+        
+        // Get sync folders
+        let folders = db.get_sync_folders().await.unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].local_path, "/home/user/documents");
+        assert_eq!(folders[0].remote_path, "documents/");
+        assert!(folders[0].enabled);
+        
+        // Toggle disabled
+        db.toggle_sync_folder(folder_id, false).await.unwrap();
+        let folders = db.get_sync_folders().await.unwrap();
+        assert!(!folders[0].enabled);
+        
+        // Remove folder
+        db.remove_sync_folder(folder_id).await.unwrap();
+        let folders = db.get_sync_folders().await.unwrap();
+        assert!(folders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_multiple_sync_folders() {
+        let (db, _temp_dir) = setup_test_db().await;
+        
+        // Add bucket
+        db.save_credentials(
+            "bucket",
+            "account",
+            "key",
+            "secret",
+            "https://endpoint.com"
+        ).await.unwrap();
+        
+        // Add multiple folders
+        db.add_sync_folder("/path/to/docs", "docs/").await.unwrap();
+        db.add_sync_folder("/path/to/photos", "photos/").await.unwrap();
+        db.add_sync_folder("/path/to/videos", "videos/").await.unwrap();
+        
+        let folders = db.get_sync_folders().await.unwrap();
+        assert_eq!(folders.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_sync_folders_without_bucket() {
+        let (db, _temp_dir) = setup_test_db().await;
+        
+        // No bucket added - get_sync_folders should return empty
+        let folders = db.get_sync_folders().await.unwrap();
+        assert!(folders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_empty_database() {
+        let (db, _temp_dir) = setup_test_db().await;
+        
+        // All queries should work on empty database
+        let creds = db.load_credentials().await.unwrap();
+        assert!(creds.is_none());
+        
+        let bucket = db.get_current_bucket().await.unwrap();
+        assert!(bucket.is_none());
+        
+        let folders = db.get_sync_folders().await.unwrap();
+        assert!(folders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_credentials_are_encrypted() {
+        let (db, _temp_dir) = setup_test_db().await;
+        
+        // Save credentials with sensitive data
+        let secret = "super-secret-key-12345";
+        db.save_credentials(
+            "bucket",
+            "account",
+            "access",
+            secret,
+            "https://endpoint.com"
+        ).await.unwrap();
+        
+        // Check that stored data is encrypted (not plaintext)
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT access_key_id, secret_access_key FROM buckets LIMIT 1"
+        )
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap();
+        
+        let (stored_access, stored_secret) = row.unwrap();
+        
+        // Stored values should NOT be plaintext
+        assert_ne!(stored_access, "access");
+        assert_ne!(stored_secret, secret);
+        
+        // But decrypted values should match original
+        let loaded = db.load_credentials().await.unwrap().unwrap();
+        assert_eq!(loaded.2, "access");
+        assert_eq!(loaded.3, secret);
+    }
+}

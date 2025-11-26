@@ -253,3 +253,317 @@ impl UploadManager {
         Ok(chunks)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    async fn setup_test_db() -> (SqlitePool, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        
+        let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        
+        // Run migrations
+        let migrations = include_str!("../../migrations/001_init.sql");
+        sqlx::query(migrations).execute(&pool).await.unwrap();
+        
+        // Add a test bucket first (required for foreign key)
+        sqlx::query(
+            "INSERT INTO buckets (name, account_id, access_key_id, secret_access_key, endpoint) 
+             VALUES ('test-bucket', 'account', 'key', 'secret', 'https://endpoint.com')"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        
+        (pool, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_create_upload() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        let upload_id = manager.create_upload(
+            1,
+            "/path/to/file.txt",
+            "remote/file.txt",
+            1024,
+            256,
+        ).await.unwrap();
+        
+        // UUID v4 should be 36 characters
+        assert_eq!(upload_id.len(), 36);
+    }
+
+    #[tokio::test]
+    async fn test_get_upload() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        let upload_id = manager.create_upload(
+            1,
+            "/path/to/document.pdf",
+            "documents/document.pdf",
+            2048,
+            512,
+        ).await.unwrap();
+        
+        let upload = manager.get_upload(&upload_id).await.unwrap();
+        assert!(upload.is_some());
+        
+        let upload = upload.unwrap();
+        assert_eq!(upload.id, upload_id);
+        assert_eq!(upload.file_name, "document.pdf");
+        assert_eq!(upload.file_path, "/path/to/document.pdf");
+        assert_eq!(upload.remote_path, "documents/document.pdf");
+        assert_eq!(upload.total_size, 2048);
+        assert_eq!(upload.uploaded_size, 0);
+        assert!(matches!(upload.status, UploadStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_upload() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        let upload = manager.get_upload("nonexistent-id").await.unwrap();
+        assert!(upload.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_upload_status() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        let upload_id = manager.create_upload(
+            1,
+            "/path/to/file.txt",
+            "remote/file.txt",
+            1024,
+            256,
+        ).await.unwrap();
+        
+        // Update to uploading
+        manager.update_upload_status(&upload_id, "uploading", Some(512), None).await.unwrap();
+        
+        let upload = manager.get_upload(&upload_id).await.unwrap().unwrap();
+        assert!(matches!(upload.status, UploadStatus::Uploading));
+        assert_eq!(upload.uploaded_size, 512);
+        assert!((upload.progress - 50.0).abs() < 0.01);
+        
+        // Update to completed
+        manager.update_upload_status(&upload_id, "completed", Some(1024), None).await.unwrap();
+        
+        let upload = manager.get_upload(&upload_id).await.unwrap().unwrap();
+        assert!(matches!(upload.status, UploadStatus::Completed));
+        assert_eq!(upload.uploaded_size, 1024);
+    }
+
+    #[tokio::test]
+    async fn test_update_upload_with_error() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        let upload_id = manager.create_upload(
+            1,
+            "/path/to/file.txt",
+            "remote/file.txt",
+            1024,
+            256,
+        ).await.unwrap();
+        
+        // Update to failed with error message
+        manager.update_upload_status(
+            &upload_id, 
+            "failed", 
+            None, 
+            Some("Network error")
+        ).await.unwrap();
+        
+        let upload = manager.get_upload(&upload_id).await.unwrap().unwrap();
+        assert!(matches!(upload.status, UploadStatus::Failed));
+        assert_eq!(upload.error_message, Some("Network error".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_active_uploads() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        // Create multiple uploads with different statuses
+        let id1 = manager.create_upload(1, "/file1.txt", "file1.txt", 100, 50).await.unwrap();
+        let id2 = manager.create_upload(1, "/file2.txt", "file2.txt", 200, 50).await.unwrap();
+        let id3 = manager.create_upload(1, "/file3.txt", "file3.txt", 300, 50).await.unwrap();
+        let id4 = manager.create_upload(1, "/file4.txt", "file4.txt", 400, 50).await.unwrap();
+        
+        manager.update_upload_status(&id1, "uploading", None, None).await.unwrap();
+        manager.update_upload_status(&id2, "paused", None, None).await.unwrap();
+        manager.update_upload_status(&id3, "completed", None, None).await.unwrap();
+        manager.update_upload_status(&id4, "failed", None, Some("Error")).await.unwrap();
+        
+        // Get active uploads (pending, uploading, paused)
+        let active = manager.get_active_uploads().await.unwrap();
+        
+        // id1 (uploading), id2 (paused) should be active
+        // id3 (completed), id4 (failed) should not be active
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|u| u.id == id1));
+        assert!(active.iter().any(|u| u.id == id2));
+    }
+
+    #[tokio::test]
+    async fn test_save_and_get_chunks() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        let upload_id = manager.create_upload(
+            1,
+            "/path/to/large_file.zip",
+            "large_file.zip",
+            10 * 1024 * 1024, // 10MB
+            5 * 1024 * 1024,  // 5MB chunks
+        ).await.unwrap();
+        
+        // Save chunks
+        manager.save_chunk(&upload_id, 1, 5 * 1024 * 1024, Some("etag1"), "completed").await.unwrap();
+        manager.save_chunk(&upload_id, 2, 5 * 1024 * 1024, Some("etag2"), "completed").await.unwrap();
+        
+        // Get completed chunks
+        let chunks = manager.get_completed_chunks(&upload_id).await.unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], (1, "etag1".to_string()));
+        assert_eq!(chunks[1], (2, "etag2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_chunk_upsert() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        let upload_id = manager.create_upload(
+            1,
+            "/file.bin",
+            "file.bin",
+            1024,
+            512,
+        ).await.unwrap();
+        
+        // Save chunk first time
+        manager.save_chunk(&upload_id, 1, 512, None, "uploading").await.unwrap();
+        
+        // Update same chunk (upsert)
+        manager.save_chunk(&upload_id, 1, 512, Some("final_etag"), "completed").await.unwrap();
+        
+        // Should have only one chunk with updated values
+        let chunks = manager.get_completed_chunks(&upload_id).await.unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].1, "final_etag");
+    }
+
+    #[tokio::test]
+    async fn test_set_multipart_upload_id() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        let upload_id = manager.create_upload(
+            1,
+            "/large_file.bin",
+            "large_file.bin",
+            100 * 1024 * 1024,
+            10 * 1024 * 1024,
+        ).await.unwrap();
+        
+        // Set multipart upload ID (from S3)
+        manager.set_multipart_upload_id(&upload_id, "aws-multipart-id-12345").await.unwrap();
+        
+        // Verify it was saved
+        let row: (Option<String>,) = sqlx::query_as(
+            "SELECT upload_id FROM uploads WHERE id = ?"
+        )
+        .bind(&upload_id)
+        .fetch_one(manager.pool())
+        .await
+        .unwrap();
+        
+        assert_eq!(row.0, Some("aws-multipart-id-12345".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_windows_path_normalization() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        // Test with Windows-style path
+        let upload_id = manager.create_upload(
+            1,
+            r"C:\Users\test\Documents\file.txt",
+            "documents/file.txt",
+            1024,
+            256,
+        ).await.unwrap();
+        
+        let upload = manager.get_upload(&upload_id).await.unwrap().unwrap();
+        
+        // File name should be extracted correctly even from Windows paths
+        assert_eq!(upload.file_name, "file.txt");
+    }
+
+    #[tokio::test]
+    async fn test_progress_calculation() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        let upload_id = manager.create_upload(
+            1,
+            "/file.bin",
+            "file.bin",
+            1000,
+            100,
+        ).await.unwrap();
+        
+        // 0% progress initially
+        let upload = manager.get_upload(&upload_id).await.unwrap().unwrap();
+        assert_eq!(upload.progress, 0.0);
+        
+        // 25% progress
+        manager.update_upload_status(&upload_id, "uploading", Some(250), None).await.unwrap();
+        let upload = manager.get_upload(&upload_id).await.unwrap().unwrap();
+        assert!((upload.progress - 25.0).abs() < 0.01);
+        
+        // 100% progress
+        manager.update_upload_status(&upload_id, "completed", Some(1000), None).await.unwrap();
+        let upload = manager.get_upload(&upload_id).await.unwrap().unwrap();
+        assert!((upload.progress - 100.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_zero_size_file() {
+        let (pool, _temp_dir) = setup_test_db().await;
+        let manager = UploadManager::new(pool);
+        
+        let upload_id = manager.create_upload(
+            1,
+            "/empty.txt",
+            "empty.txt",
+            0,  // Zero size file
+            256,
+        ).await.unwrap();
+        
+        let upload = manager.get_upload(&upload_id).await.unwrap().unwrap();
+        // Progress should be 0 (not NaN or panic)
+        assert_eq!(upload.progress, 0.0);
+    }
+
+    // Add helper method for tests
+    impl UploadManager {
+        #[cfg(test)]
+        fn pool(&self) -> &SqlitePool {
+            &self.pool
+        }
+    }
+}
+
