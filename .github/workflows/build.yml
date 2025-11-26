@@ -5,12 +5,21 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., 0.1.0)'
+        required: false
+        default: '0.1.0'
+
+permissions:
+  contents: write
 
 jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
       
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -19,26 +28,39 @@ jobs:
           cache: 'npm'
       
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
       
       - name: Install dependencies
         run: npm ci
       
-      - name: Build Tauri App
+      - name: Build Tauri App (macOS)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'Cloudflare Backup v__VERSION__'
-          releaseBody: 'See the assets to download this version and install.'
+          releaseName: 'Cloudflare Backup ${{ github.ref_name }}'
+          releaseBody: |
+            ## Cloudflare Backup ${{ github.ref_name }}
+            
+            ### Downloads
+            - **macOS**: Download the `.dmg` file
+            - **Windows**: Download the `.exe` or `.msi` installer
+            
+            ### Installation
+            1. Download the installer for your platform
+            2. Run the installer
+            3. Open the app and go to Settings
+            4. Enter your Cloudflare R2 credentials
+            5. Start backing up!
           releaseDraft: true
           prerelease: false
 
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
       
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -47,18 +69,63 @@ jobs:
           cache: 'npm'
       
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
       
       - name: Install dependencies
         run: npm ci
       
-      - name: Build Tauri App
+      - name: Build Tauri App (Windows)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'Cloudflare Backup v__VERSION__'
-          releaseBody: 'See the assets to download this version and install.'
+          releaseName: 'Cloudflare Backup ${{ github.ref_name }}'
+          releaseBody: |
+            ## Cloudflare Backup ${{ github.ref_name }}
+            
+            ### Downloads
+            - **macOS**: Download the `.dmg` file
+            - **Windows**: Download the `.exe` or `.msi` installer
+          releaseDraft: true
+          prerelease: false
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build Tauri App (Linux)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Cloudflare Backup ${{ github.ref_name }}'
+          releaseBody: |
+            ## Cloudflare Backup ${{ github.ref_name }}
+            
+            ### Downloads
+            - **macOS**: Download the `.dmg` file
+            - **Windows**: Download the `.exe` or `.msi` installer
+            - **Linux**: Download the `.AppImage` or `.deb` file
           releaseDraft: true
           prerelease: false
