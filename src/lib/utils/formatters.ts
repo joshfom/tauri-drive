@@ -32,6 +32,32 @@ export function calculateETA(totalBytes: number, uploadedBytes: number, bytesPer
   return Math.round(remainingBytes / bytesPerSecond);
 }
 
+/**
+ * Extract file name from a path, handling both Windows and Unix paths
+ * @param path - Full file path (can be Windows C:\... or Unix /...)
+ * @returns Just the file name without the directory path
+ */
+export function extractFileName(path: string): string {
+  if (!path) return 'unknown';
+  // Normalize Windows backslashes to forward slashes first
+  const normalizedPath = path.replace(/\\/g, '/');
+  const parts = normalizedPath.split('/');
+  return parts[parts.length - 1] || path;
+}
+
+/**
+ * Extract folder name from a path, handling both Windows and Unix paths
+ * @param path - Full folder path (can be Windows C:\... or Unix /...)
+ * @returns Just the folder name without the parent path
+ */
+export function extractFolderName(path: string): string {
+  if (!path) return 'unknown';
+  // Normalize Windows backslashes to forward slashes first
+  const normalizedPath = path.replace(/\\/g, '/').replace(/\/$/, ''); // Remove trailing slash
+  const parts = normalizedPath.split('/');
+  return parts[parts.length - 1] || path;
+}
+
 export function getFileExtension(filename: string): string {
   const parts = filename.split('.');
   return parts.length > 1 ? parts[parts.length - 1].toLowerCase() : '';

@@ -8,6 +8,8 @@ import {
   isImageFile,
   isVideoFile,
   getFileIcon,
+  extractFileName,
+  extractFolderName,
 } from './formatters';
 
 describe('formatBytes', () => {
@@ -192,5 +194,54 @@ describe('getFileIcon', () => {
   it('should return default document icon for unknown types', () => {
     expect(getFileIcon('unknown.xyz')).toBe('📄');
     expect(getFileIcon('README')).toBe('📄');
+  });
+});
+
+describe('extractFileName', () => {
+  it('should extract file name from Unix paths', () => {
+    expect(extractFileName('/Users/test/Documents/file.txt')).toBe('file.txt');
+    expect(extractFileName('/home/user/image.png')).toBe('image.png');
+    expect(extractFileName('/file.pdf')).toBe('file.pdf');
+  });
+
+  it('should extract file name from Windows paths', () => {
+    expect(extractFileName('C:\\Users\\test\\Documents\\file.txt')).toBe('file.txt');
+    expect(extractFileName('D:\\Projects\\image.png')).toBe('image.png');
+    expect(extractFileName('C:\\file.pdf')).toBe('file.pdf');
+  });
+
+  it('should handle mixed path separators', () => {
+    expect(extractFileName('C:\\Users/test\\Documents/file.txt')).toBe('file.txt');
+  });
+
+  it('should return "unknown" for empty paths', () => {
+    expect(extractFileName('')).toBe('unknown');
+    expect(extractFileName(null as unknown as string)).toBe('unknown');
+    expect(extractFileName(undefined as unknown as string)).toBe('unknown');
+  });
+
+  it('should return file name for just a file name', () => {
+    expect(extractFileName('file.txt')).toBe('file.txt');
+  });
+});
+
+describe('extractFolderName', () => {
+  it('should extract folder name from Unix paths', () => {
+    expect(extractFolderName('/Users/test/Documents')).toBe('Documents');
+    expect(extractFolderName('/home/user/projects')).toBe('projects');
+  });
+
+  it('should extract folder name from Windows paths', () => {
+    expect(extractFolderName('C:\\Users\\test\\Documents')).toBe('Documents');
+    expect(extractFolderName('D:\\Projects\\MyProject')).toBe('MyProject');
+  });
+
+  it('should handle trailing slashes', () => {
+    expect(extractFolderName('/Users/test/Documents/')).toBe('Documents');
+    expect(extractFolderName('C:\\Users\\test\\Documents\\')).toBe('Documents');
+  });
+
+  it('should return "unknown" for empty paths', () => {
+    expect(extractFolderName('')).toBe('unknown');
   });
 });
