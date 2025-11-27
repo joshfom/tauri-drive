@@ -17,7 +17,9 @@ use utils::{R2Object, R2Credentials, UploadProgress, UploadStatus};
 use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
-use tauri::{Manager, Emitter};
+use tauri::{Manager, Emitter, WebviewWindow};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::menu::{Menu, MenuItem};
 
 pub struct AppState {
     pub db: Arc<Database>,
@@ -930,6 +932,41 @@ async fn create_folder(
     Ok(format!("Folder created: {}", folder_key))
 }
 
+#[derive(serde::Serialize)]
+pub struct PathInfo {
+    pub is_directory: bool,
+    pub is_file: bool,
+    pub exists: bool,
+    pub path: String,
+}
+
+/// Check if a path is a file or directory
+#[tauri::command]
+async fn check_path_type(path: String) -> Result<PathInfo, String> {
+    use std::path::Path;
+    
+    let p = Path::new(&path);
+    Ok(PathInfo {
+        is_directory: p.is_dir(),
+        is_file: p.is_file(),
+        exists: p.exists(),
+        path,
+    })
+}
+
+/// Hide the window to system tray (minimize to tray)
+#[tauri::command]
+async fn hide_to_tray(window: WebviewWindow) -> Result<(), String> {
+    window.hide().map_err(|e| e.to_string())
+}
+
+/// Show the window from system tray
+#[tauri::command]
+async fn show_from_tray(window: WebviewWindow) -> Result<(), String> {
+    window.show().map_err(|e| e.to_string())?;
+    window.set_focus().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn list_directory(
     directory_path: String,
@@ -1370,6 +1407,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let db = tauri::async_runtime::block_on(async {
                 Database::new(None).await.expect("Failed to initialize database")
@@ -1385,6 +1423,47 @@ pub fn run() {
             }));
 
             app.manage(app_state);
+
+            // Create system tray menu
+            let show_item = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            // Build tray icon
+            let _tray = TrayIconBuilder::new()
+                .menu(&menu)
+                .tooltip("Cloudflare Backup")
+                .icon(app.default_window_icon().unwrap().clone())
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1407,6 +1486,7 @@ pub fn run() {
             retry_upload,
             create_folder,
             list_directory,
+            check_path_type,
             check_connection,
             get_temp_dir,
             read_text_file,
@@ -1420,6 +1500,8 @@ pub fn run() {
             add_sync_folder,
             remove_sync_folder,
             toggle_sync_folder,
+            hide_to_tray,
+            show_from_tray,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

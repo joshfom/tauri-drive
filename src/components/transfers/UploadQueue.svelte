@@ -4,12 +4,59 @@
   import { formatBytes, formatDuration } from '$lib/utils/formatters';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification';
   import type { UploadProgress } from '$lib/types';
 
   let isExpanded = true;
   let unlisten: UnlistenFn | null = null;
+  let notificationsEnabled = false;
+  let completedIds = new Set<string>(); // Track which uploads we've already notified about
+
+  // Check and request notification permission
+  async function initNotifications() {
+    try {
+      let permissionGranted = await isPermissionGranted();
+      if (!permissionGranted) {
+        const permission = await requestPermission();
+        permissionGranted = permission === 'granted';
+      }
+      notificationsEnabled = permissionGranted;
+    } catch (e) {
+      console.error('Failed to initialize notifications:', e);
+      notificationsEnabled = false;
+    }
+  }
+
+  // Send notification for completed upload
+  async function notifyUploadComplete(fileName: string) {
+    if (!notificationsEnabled) return;
+    try {
+      sendNotification({
+        title: 'Upload Complete',
+        body: `${fileName} has been uploaded successfully.`,
+      });
+    } catch (e) {
+      console.error('Failed to send notification:', e);
+    }
+  }
+
+  // Send notification for failed upload
+  async function notifyUploadFailed(fileName: string, error?: string) {
+    if (!notificationsEnabled) return;
+    try {
+      sendNotification({
+        title: 'Upload Failed',
+        body: error ? `${fileName}: ${error}` : `Failed to upload ${fileName}`,
+      });
+    } catch (e) {
+      console.error('Failed to send notification:', e);
+    }
+  }
 
   onMount(async () => {
+    // Initialize notifications
+    await initNotifications();
+
     // Listen for upload progress events from Rust
     unlisten = await listen<UploadProgress>('upload-progress', (event) => {
       const progress = event.payload;
@@ -26,6 +73,18 @@
         // Update existing upload
         console.log('Updating existing upload:', progress.id, progress.progress.toFixed(1) + '%');
         updateUploadProgress(progress.id, progress);
+      }
+
+      // Check for completed upload and send notification
+      if (progress.status === 'completed' && !completedIds.has(progress.id)) {
+        completedIds.add(progress.id);
+        notifyUploadComplete(progress.fileName);
+      }
+      
+      // Check for failed upload and send notification
+      if (progress.status === 'failed' && !completedIds.has(progress.id)) {
+        completedIds.add(progress.id);
+        notifyUploadFailed(progress.fileName, progress.errorMessage);
       }
     });
   });

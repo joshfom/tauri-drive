@@ -14,11 +14,17 @@
       {
         "title": "Cloudflare Backup",
         "width": 1200,
-        "height": 800
+        "height": 800,
+        "visible": true
       }
     ],
     "security": {
       "csp": null
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": true,
+      "id": "main"
     }
   },
   "bundle": {
@@ -32,5 +38,9 @@
       "icons/icon.ico"
     ]
   },
-  "plugins": {}
+  "plugins": {
+    "notification": {
+      "all": true
+    }
+  }
 }

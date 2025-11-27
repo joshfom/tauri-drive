@@ -9,10 +9,9 @@
   import Transfers from './routes/Transfers.svelte';
   import SyncFolders from './routes/SyncFolders.svelte';
   import UpdateScreen from './components/UpdateScreen.svelte';
-  import UploadQueue from './components/transfers/UploadQueue.svelte';
-  import type { UploadProgress, DownloadProgress } from './lib/types';
-
-  const routes = {
+import UploadQueue from './components/transfers/UploadQueue.svelte';
+import DownloadQueue from './components/transfers/DownloadQueue.svelte';
+import type { UploadProgress, DownloadProgress } from './lib/types';  const routes = {
     '/': Browser,
     '/settings': Settings,
     '/transfers': Transfers,
@@ -47,6 +46,14 @@
       connectionStatus = await invoke<ConnectionStatus>('check_connection');
     } catch (e) {
       connectionStatus = { connected: false, bucket: null, error: String(e) };
+    }
+  }
+
+  async function minimizeToTray() {
+    try {
+      await invoke('hide_to_tray');
+    } catch (e) {
+      console.error('Failed to minimize to tray:', e);
     }
   }
 
@@ -202,8 +209,20 @@
       </a>
     </nav>
 
-    <!-- Connection Status -->
-    <div class="px-3 py-4 border-t border-gray-200 dark:border-gray-800">
+    <!-- Connection Status & Tray Button -->
+    <div class="px-3 py-4 border-t border-gray-200 dark:border-gray-800 space-y-3">
+      <!-- Minimize to Tray button -->
+      <button
+        on:click={minimizeToTray}
+        class="flex items-center gap-3 w-full px-3 py-2 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
+        title="Minimize to system tray"
+      >
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 14l-7 7m0 0l-7-7m7 7V3"/>
+        </svg>
+        <span class="text-sm font-medium">Minimize to Tray</span>
+      </button>
+
       {#if connectionStatus.connected}
         <div class="flex items-center gap-3 px-3 py-2 bg-green-50 dark:bg-green-900/10 rounded-lg">
           <div class="w-2 h-2 rounded-full bg-green-500"></div>
@@ -268,3 +287,6 @@
 
 <!-- Floating Upload Queue -->
 <UploadQueue />
+
+<!-- Floating Download Queue -->
+<DownloadQueue />

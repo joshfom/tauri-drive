@@ -17,7 +17,7 @@
   let breadcrumbs: { name: string; path: string }[] = [];
   let loading = false;
   let error = '';
-  let uploading = false;
+  let activeUploads = 0; // Track number of active uploads
   let isDragging = false;
 
   // Confirmation dialog state
@@ -89,10 +89,12 @@
   }
 
   async function uploadFiles(filePaths: string[]) {
-    uploading = true;
+    activeUploads += filePaths.length;
     
     for (const filePath of filePaths) {
-      const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || 'unknown';
+      // Normalize path separators and extract file name (handles both Windows \ and Unix /)
+      const normalizedPath = filePath.replace(/\\/g, '/');
+      const fileName = normalizedPath.split('/').pop() || 'unknown';
       const remotePath = currentPath ? `${currentPath}/${fileName}` : fileName;
       
       try {
@@ -105,15 +107,15 @@
       } catch (e) {
         console.error('Upload failed:', e);
         error = `Failed to upload ${fileName}: ${e}`;
+      } finally {
+        activeUploads--;
       }
     }
     
-    uploading = false;
     await loadObjects();
   }
 
   async function uploadFolder(folderPath: string) {
-    uploading = true;
     error = '';
     
     try {
@@ -122,17 +124,21 @@
       
       if (allFiles.length === 0) {
         error = 'Folder is empty';
-        uploading = false;
         return;
       }
 
-      // Get folder name from path
-      const folderName = folderPath.split('/').pop() || folderPath.split('\\').pop() || 'folder';
+      activeUploads += allFiles.length;
+
+      // Get folder name from path (normalize for Windows)
+      const normalizedFolderPath = folderPath.replace(/\\/g, '/');
+      const folderName = normalizedFolderPath.split('/').pop() || 'folder';
       
       // Upload all files maintaining folder structure
       for (const filePath of allFiles) {
-        // Get relative path from the selected folder
-        const relativePath = filePath.replace(folderPath, '').replace(/^\//, '').replace(/^\\/, '');
+        // Get relative path from the selected folder (normalize for Windows)
+        const normalizedFilePath = filePath.replace(/\\/g, '/');
+        const normalizedBasePath = folderPath.replace(/\\/g, '/');
+        const relativePath = normalizedFilePath.replace(normalizedBasePath, '').replace(/^\//, '');
         
         // Construct remote path
         const remotePath = currentPath 
@@ -147,12 +153,13 @@
         } catch (e) {
           console.error(`Failed to upload ${filePath}:`, e);
           error = `Failed to upload some files: ${e}`;
+        } finally {
+          activeUploads--;
         }
       }
     } catch (e) {
       error = `Folder upload failed: ${e}`;
     } finally {
-      uploading = false;
       await loadObjects();
     }
   }
@@ -250,6 +257,14 @@
     showConfirmDialog = true;
   }
 
+  // Path info type returned from Rust
+  interface PathInfo {
+    is_directory: boolean;
+    is_file: boolean;
+    exists: boolean;
+    path: string;
+  }
+
   // Drag and drop handlers
   function handleDragEnter(e: DragEvent) {
     e.preventDefault();
@@ -273,19 +288,50 @@
 
     if (!e.dataTransfer?.files) return;
 
-    const filePaths: string[] = [];
+    const droppedPaths: string[] = [];
     for (let i = 0; i < e.dataTransfer.files.length; i++) {
       const file = e.dataTransfer.files[i];
       // @ts-ignore - Tauri provides path property
       if (file.path) {
         // @ts-ignore
-        filePaths.push(file.path);
+        droppedPaths.push(file.path);
       }
     }
 
-    if (filePaths.length > 0) {
-      await uploadFiles(filePaths);
+    if (droppedPaths.length === 0) return;
+
+    // Check each path type and separate into files and folders
+    const filePaths: string[] = [];
+    const folderPaths: string[] = [];
+
+    for (const path of droppedPaths) {
+      try {
+        const pathInfo = await invoke<PathInfo>('check_path_type', { path });
+        if (pathInfo.is_directory) {
+          folderPaths.push(path);
+        } else if (pathInfo.is_file) {
+          filePaths.push(path);
+        }
+      } catch (e) {
+        console.error(`Failed to check path type for ${path}:`, e);
+        // Assume it's a file if we can't check
+        filePaths.push(path);
+      }
     }
+
+    // Upload files and folders in parallel
+    const uploadPromises: Promise<void>[] = [];
+    
+    if (filePaths.length > 0) {
+      uploadPromises.push(uploadFiles(filePaths));
+    }
+    
+    // Upload each folder separately (they each maintain their own structure)
+    for (const folderPath of folderPaths) {
+      uploadPromises.push(uploadFolder(folderPath));
+    }
+
+    await Promise.all(uploadPromises);
   }
 
   onMount(() => {
@@ -348,8 +394,7 @@
         
         <button
           on:click={handleUploadFolder}
-          disabled={uploading}
-          class="flex items-center gap-2 px-3 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors disabled:opacity-50"
+          class="flex items-center gap-2 px-3 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
         >
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
@@ -359,13 +404,12 @@
         
         <button
           on:click={handleUploadFiles}
-          disabled={uploading}
-          class="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50"
+          class="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors"
         >
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
           </svg>
-          <span>{uploading ? 'Uploading...' : 'Upload'}</span>
+          <span>Upload</span>
         </button>
       </div>
     </div>
@@ -375,7 +419,7 @@
   <div 
     role="region"
     aria-label="File drop zone"
-    class="flex-1 overflow-auto p-6"
+    class="flex-1 overflow-auto p-6 transition-all duration-200 {isDragging ? 'bg-blue-50/50 dark:bg-blue-900/10' : ''}"
     on:dragenter={handleDragEnter}
     on:dragleave={handleDragLeave}
     on:dragover={handleDragOver}
@@ -383,12 +427,33 @@
   >
     <!-- Drag overlay -->
     {#if isDragging}
-      <div class="fixed inset-0 bg-blue-500/10 z-40 flex items-center justify-center">
-        <div class="bg-white dark:bg-gray-800 rounded-xl p-8 border-2 border-dashed border-blue-500">
-          <svg class="w-12 h-12 text-blue-600 dark:text-blue-400 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
-          </svg>
-          <p class="mt-4 text-lg font-medium text-gray-900 dark:text-white">Drop files here to upload</p>
+      <!-- Animated border effect -->
+      <div class="fixed inset-4 border-2 border-dashed border-blue-500 rounded-2xl z-30 pointer-events-none animate-pulse"></div>
+      
+      <!-- Center overlay -->
+      <div class="fixed inset-0 bg-blue-500/5 z-40 flex items-center justify-center pointer-events-none backdrop-blur-[1px]">
+        <div class="bg-white dark:bg-gray-800 rounded-2xl p-10 border-2 border-blue-500 shadow-2xl transform transition-transform scale-100">
+          <!-- Animated icons -->
+          <div class="flex justify-center gap-6 mb-6">
+            <div class="animate-bounce" style="animation-delay: 0ms;">
+              <svg class="w-12 h-12 text-blue-600 dark:text-blue-400 drop-shadow-lg" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+              </svg>
+            </div>
+            <div class="animate-bounce" style="animation-delay: 150ms;">
+              <svg class="w-12 h-12 text-amber-500 drop-shadow-lg" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M10 4H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V8a2 2 0 00-2-2h-8l-2-2z"/>
+              </svg>
+            </div>
+          </div>
+          <p class="text-xl font-semibold text-gray-900 dark:text-white text-center mb-2">Drop files or folders to upload</p>
+          <p class="text-sm text-gray-500 dark:text-gray-400 text-center">
+            {#if currentPath}
+              Uploading to: <span class="font-medium text-blue-600 dark:text-blue-400">{currentPath}</span>
+            {:else}
+              Uploading to root folder
+            {/if}
+          </p>
         </div>
       </div>
     {/if}

@@ -1,17 +1,15 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import type { UploadProgress, DownloadProgress } from '../lib/types';
   import { formatBytes, formatDuration } from '../lib/utils/formatters';
-  import { uploadQueue } from '../lib/stores/uploads';
+  import { uploadQueue, downloadQueue } from '../lib/stores/uploads';
 
   // Use the shared upload queue store
   $: uploads = $uploadQueue;
   
-  let downloads: Map<string, DownloadProgress> = new Map();
+  // Use the shared download queue store
+  $: downloads = $downloadQueue;
   let activeTab: 'uploads' | 'downloads' = 'uploads';
-  let unlistenDownload: UnlistenFn | null = null;
 
   $: downloadsList = Array.from(downloads.values());
   $: activeDownloads = downloadsList.filter(d => d.status === 'downloading');
@@ -48,32 +46,8 @@
     }
   }
 
-  onMount(() => {
-    // Listen for download progress events
-    listen<DownloadProgress>('download-progress', (event) => {
-      const progress = event.payload;
-      if (progress.status === 'completed') {
-        // Keep completed downloads for a bit, then remove
-        downloads.set(progress.id, progress);
-        downloads = downloads;
-        setTimeout(() => {
-          downloads.delete(progress.id);
-          downloads = downloads;
-        }, 5000);
-      } else {
-        downloads.set(progress.id, progress);
-        downloads = downloads;
-      }
-    }).then((unlisten) => {
-      unlistenDownload = unlisten;
-    });
-  });
-
-  onDestroy(() => {
-    if (unlistenDownload) {
-      unlistenDownload();
-    }
-  });
+  // Note: Download progress events are handled by DownloadQueue component
+  // Transfers page just displays from the shared store
 </script>
 
 <div class="flex flex-col h-full">
