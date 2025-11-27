@@ -10,6 +10,7 @@
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import CreateFolderDialog from '../components/CreateFolderDialog.svelte';
   import FilePreviewModal from '../components/FilePreviewModal.svelte';
+  import RenameDialog from '../components/RenameDialog.svelte';
 
   let objects: R2Object[] = [];
   let fileNodes: FileNode[] = [];
@@ -33,11 +34,25 @@
   let showPreviewModal = false;
   let previewFile: FileNode | null = null;
 
+  // Rename dialog state
+  let showRenameDialog = false;
+  let renameNode: FileNode | null = null;
+
+  // Action menu state
+  let activeMenuNode: FileNode | null = null;
+
   $: breadcrumbs = currentPath ? [{ name: 'Home', path: '' }, ...getBreadcrumbs(currentPath)] : [{ name: 'Home', path: '' }];
   $: fileNodes = parseObjectsIntoFolders(objects, currentPath);
   
   // Sync currentPath to store whenever it changes
   $: currentBrowserPath.set(currentPath);
+
+  // Close menu when clicking outside
+  function handleGlobalClick(e: MouseEvent) {
+    if (activeMenuNode) {
+      activeMenuNode = null;
+    }
+  }
 
   async function loadObjects() {
     loading = true;
@@ -224,6 +239,27 @@
     }
   }
 
+  // Optimistic update helper - remove item from objects list
+  function removeFromObjects(path: string, isFolder: boolean) {
+    if (isFolder) {
+      // Remove folder and all its contents
+      const folderPrefix = path.endsWith('/') ? path : `${path}/`;
+      objects = objects.filter(obj => !obj.key.startsWith(folderPrefix) && obj.key !== path && obj.key !== folderPrefix);
+    } else {
+      objects = objects.filter(obj => obj.key !== path);
+    }
+  }
+
+  // Optimistic update helper - update item name in objects list
+  function renameInObjects(oldPath: string, newPath: string) {
+    objects = objects.map(obj => {
+      if (obj.key === oldPath) {
+        return { ...obj, key: newPath };
+      }
+      return obj;
+    });
+  }
+
   async function handleDelete(node: FileNode) {
     const itemType = node.isFolder ? 'folder' : 'file';
     confirmTitle = `Delete ${itemType}?`;
@@ -232,6 +268,9 @@
       : `Are you sure you want to delete "${node.name}"? This action cannot be undone.`;
     
     confirmAction = async () => {
+      // Optimistic update - remove from UI immediately
+      removeFromObjects(node.path, node.isFolder);
+      
       try {
         if (node.isFolder) {
           // Get all files in folder and delete them
@@ -248,13 +287,65 @@
         } else {
           await invoke('delete_file', { remoteKey: node.path });
         }
-        await loadObjects();
+        // No need to reload - optimistic update already applied
       } catch (e) {
+        // Revert on error - reload from server
         error = `Delete failed: ${e}`;
+        await loadObjects();
       }
     };
     
     showConfirmDialog = true;
+  }
+
+  async function handleRename(node: FileNode) {
+    renameNode = node;
+    showRenameDialog = true;
+    activeMenuNode = null;
+  }
+
+  async function confirmRename(newName: string) {
+    if (!renameNode) return;
+    
+    const node = renameNode;
+    const oldPath = node.path;
+    const parentPath = oldPath.includes('/') ? oldPath.substring(0, oldPath.lastIndexOf('/') + 1) : '';
+    const newPath = parentPath + newName;
+    
+    // Optimistic update
+    renameInObjects(oldPath, newPath);
+    
+    try {
+      if (node.isFolder) {
+        // For folders, we need to rename all contents
+        const files = getAllFilesInFolder(node);
+        for (const filePath of files) {
+          const relativePath = filePath.substring(oldPath.length);
+          const newFilePath = newPath + relativePath;
+          await invoke('rename_file', { oldKey: filePath, newKey: newFilePath });
+        }
+        // Also rename folder marker if exists
+        try {
+          await invoke('rename_file', { oldKey: oldPath + '/', newKey: newPath + '/' });
+        } catch (e) {
+          // Folder marker might not exist
+        }
+      } else {
+        await invoke('rename_file', { oldKey: oldPath, newKey: newPath });
+      }
+      // Reload to ensure consistency
+      await loadObjects();
+    } catch (e) {
+      error = `Rename failed: ${e}`;
+      await loadObjects();
+    }
+    
+    renameNode = null;
+  }
+
+  function toggleMenu(e: MouseEvent, node: FileNode) {
+    e.stopPropagation();
+    activeMenuNode = activeMenuNode === node ? null : node;
   }
 
   // Path info type returned from Rust
@@ -344,6 +435,12 @@
     unsubscribe(); // Only read once on mount
     
     loadObjects();
+    
+    // Add global click listener to close menu
+    document.addEventListener('click', handleGlobalClick);
+    return () => {
+      document.removeEventListener('click', handleGlobalClick);
+    };
   });
 </script>
 
@@ -570,40 +667,67 @@
               </p>
             </div>
             
-            <!-- Action menu on hover -->
-            <div class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
-              <div class="flex items-center gap-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-1">
-                {#if !node.isFolder}
+            <!-- 3-dot action menu -->
+            <div class="absolute top-2 right-2">
+              <button
+                on:click={(e) => toggleMenu(e, node)}
+                class="p-1.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg opacity-0 group-hover:opacity-100 transition-all"
+                title="More actions"
+              >
+                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                  <circle cx="12" cy="5" r="2"/>
+                  <circle cx="12" cy="12" r="2"/>
+                  <circle cx="12" cy="19" r="2"/>
+                </svg>
+              </button>
+              
+              <!-- Dropdown menu -->
+              {#if activeMenuNode === node}
+                <div 
+                  class="absolute right-0 top-full mt-1 w-44 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-lg py-1.5 z-50"
+                >
+                  {#if !node.isFolder}
+                    <button
+                      on:click|stopPropagation={() => { handlePreview(node); activeMenuNode = null; }}
+                      class="w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-3"
+                    >
+                      <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+                      </svg>
+                      View
+                    </button>
+                  {/if}
                   <button
-                    on:click|stopPropagation={() => handlePreview(node)}
-                    class="p-1.5 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
-                    title="Preview"
+                    on:click|stopPropagation={() => { handleDownload(node); activeMenuNode = null; }}
+                    class="w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-3"
+                  >
+                    <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+                    </svg>
+                    {node.isFolder ? 'Download ZIP' : 'Download'}
+                  </button>
+                  <button
+                    on:click|stopPropagation={() => handleRename(node)}
+                    class="w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-3"
+                  >
+                    <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                    </svg>
+                    Rename
+                  </button>
+                  <div class="border-t border-gray-200 dark:border-gray-700 my-1.5"></div>
+                  <button
+                    on:click|stopPropagation={() => { handleDelete(node); activeMenuNode = null; }}
+                    class="w-full px-4 py-2 text-left text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center gap-3"
                   >
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
                     </svg>
+                    Delete
                   </button>
-                {/if}
-                <button
-                  on:click|stopPropagation={() => handleDownload(node)}
-                  class="p-1.5 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
-                  title={node.isFolder ? 'Download as ZIP' : 'Download'}
-                >
-                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
-                  </svg>
-                </button>
-                <button
-                  on:click|stopPropagation={() => handleDelete(node)}
-                  class="p-1.5 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 rounded"
-                  title="Delete"
-                >
-                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
-                  </svg>
-                </button>
-              </div>
+                </div>
+              {/if}
             </div>
           </div>
         {/each}
@@ -630,6 +754,15 @@
   currentPath={currentPath}
   onConfirm={handleCreateFolder}
   onCancel={() => {}}
+/>
+
+<!-- Rename Dialog -->
+<RenameDialog
+  bind:isOpen={showRenameDialog}
+  currentName={renameNode?.name || ''}
+  isFolder={renameNode?.isFolder || false}
+  onConfirm={confirmRename}
+  onCancel={() => { renameNode = null; }}
 />
 
 <!-- File Preview Modal -->

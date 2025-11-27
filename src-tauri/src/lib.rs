@@ -557,6 +557,41 @@ async fn delete_file(
 }
 
 #[tauri::command]
+async fn rename_file(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    old_key: String,
+    new_key: String,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+    let client_guard = app_state.r2_client.lock().await;
+    
+    let client = client_guard
+        .as_ref()
+        .ok_or("Not connected to R2")?;
+
+    // Copy to new location
+    r2::operations::copy_object(
+        client.client(),
+        client.bucket(),
+        &old_key,
+        &new_key,
+    )
+    .await
+    .map_err(|e| format!("Failed to copy: {}", e))?;
+
+    // Delete old file
+    r2::operations::delete_object(
+        client.client(),
+        client.bucket(),
+        &old_key,
+    )
+    .await
+    .map_err(|e| format!("Failed to delete old file: {}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_active_uploads(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<UploadProgress>, String> {
@@ -1502,6 +1537,7 @@ pub fn run() {
             toggle_sync_folder,
             hide_to_tray,
             show_from_tray,
+            rename_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
