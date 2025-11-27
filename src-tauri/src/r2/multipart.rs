@@ -11,7 +11,7 @@ use tokio::fs::File;
 use tokio::sync::{Mutex, Semaphore};
 use futures::future::join_all;
 
-const DEFAULT_CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
+const DEFAULT_CHUNK_SIZE: usize = 5 * 1024 * 1024; // 5MB for more frequent progress updates
 const MIN_CHUNK_SIZE: usize = 5 * 1024 * 1024; // 5MB minimum for S3
 const MAX_CONCURRENT_UPLOADS: usize = 8; // 8 concurrent chunk uploads
 
@@ -192,10 +192,60 @@ impl MultipartUpload {
 
         // Shared state for tracking progress
         let total_uploaded = Arc::new(AtomicI64::new(0));
+        let chunks_in_flight = Arc::new(AtomicI64::new(0));
+        let max_reported_progress = Arc::new(AtomicI64::new(0)); // Track max to prevent jumping back
         let start_time = Instant::now();
         let parts: Arc<Mutex<Vec<(i32, String)>>> = Arc::new(Mutex::new(Vec::with_capacity(num_parts as usize)));
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS));
         let progress_callback = Arc::new(Mutex::new(progress_callback));
+        let upload_done = Arc::new(AtomicBool::new(false));
+
+        // Spawn a heartbeat task that sends progress updates every 500ms
+        // This ensures the UI updates even while chunks are being uploaded
+        let heartbeat_callback = progress_callback.clone();
+        let heartbeat_uploaded = total_uploaded.clone();
+        let heartbeat_in_flight = chunks_in_flight.clone();
+        let heartbeat_done = upload_done.clone();
+        let heartbeat_max_progress = max_reported_progress.clone();
+        let heartbeat_chunk_size = chunk_size as i64;
+        
+        tokio::spawn(async move {
+            while !heartbeat_done.load(Ordering::SeqCst) {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                
+                if heartbeat_done.load(Ordering::SeqCst) {
+                    break;
+                }
+                
+                let completed_bytes = heartbeat_uploaded.load(Ordering::SeqCst);
+                let in_flight = heartbeat_in_flight.load(Ordering::SeqCst);
+                
+                // Estimate progress: completed bytes + (in-flight chunks at ~30% average progress)
+                // Use 30% instead of 50% to avoid overestimating and jumping back
+                let estimated_in_flight_bytes = (in_flight * heartbeat_chunk_size * 3) / 10;
+                let estimated_uploaded = (completed_bytes + estimated_in_flight_bytes).min(file_size);
+                
+                // Get the current max and only report if higher
+                let current_max = heartbeat_max_progress.load(Ordering::SeqCst);
+                if estimated_uploaded > current_max {
+                    // Update max progress atomically
+                    heartbeat_max_progress.fetch_max(estimated_uploaded, Ordering::SeqCst);
+                    
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 { completed_bytes as f64 / elapsed } else { 0.0 };
+                    let remaining_bytes = file_size - completed_bytes;
+                    let eta = if speed > 0.0 { (remaining_bytes as f64 / speed) as i64 } else { 0 };
+                    
+                    let mut callback = heartbeat_callback.lock().await;
+                    callback(UploadProgressInfo {
+                        uploaded_bytes: estimated_uploaded,
+                        total_bytes: file_size,
+                        speed_bytes_per_sec: speed,
+                        eta_seconds: eta,
+                    });
+                }
+            }
+        });
 
         // Read all chunks and create upload tasks
         let mut tasks = Vec::new();
@@ -239,6 +289,7 @@ impl MultipartUpload {
             let paused = self.paused.clone();
             let current_part = part_number;
             let chunk_len = buffer.len() as i64;
+            let in_flight_clone = chunks_in_flight.clone();
 
             let task = tokio::spawn(async move {
                 // Acquire semaphore permit to limit concurrency
@@ -255,16 +306,24 @@ impl MultipartUpload {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
 
+                // Mark this chunk as in-flight
+                in_flight_clone.fetch_add(1, Ordering::SeqCst);
+                
                 log::debug!("Uploading part {} ({} bytes)", current_part, chunk_len);
 
-                let etag = Self::upload_part_internal(
+                let result = Self::upload_part_internal(
                     &client,
                     &bucket,
                     &key,
                     &upload_id,
                     current_part,
                     buffer,
-                ).await?;
+                ).await;
+                
+                // Mark this chunk as no longer in-flight
+                in_flight_clone.fetch_sub(1, Ordering::SeqCst);
+                
+                let etag = result?;
 
                 // Update progress
                 let uploaded = total_uploaded_clone.fetch_add(chunk_len, Ordering::SeqCst) + chunk_len;
@@ -283,6 +342,14 @@ impl MultipartUpload {
 
                 // Call progress callback
                 {
+                    log::info!(
+                        "Chunk {} completed: {}/{} bytes ({:.1}%), speed: {:.2} MB/s",
+                        current_part,
+                        uploaded,
+                        file_size,
+                        (uploaded as f64 / file_size as f64) * 100.0,
+                        speed / (1024.0 * 1024.0)
+                    );
                     let mut callback = progress_callback_clone.lock().await;
                     callback(UploadProgressInfo {
                         uploaded_bytes: uploaded,
@@ -302,6 +369,9 @@ impl MultipartUpload {
 
         // Wait for all uploads to complete
         let results = join_all(tasks).await;
+        
+        // Stop the heartbeat task
+        upload_done.store(true, Ordering::SeqCst);
         
         // Check for errors
         for result in results {

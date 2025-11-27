@@ -256,10 +256,11 @@
       
       <div class="space-y-4">
         <div>
-          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+          <label for="local-folder-input" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
             Local Folder
           </label>
           <input
+            id="local-folder-input"
             type="text"
             value={newFolderPath}
             readonly
@@ -268,12 +269,13 @@
         </div>
         
         <div>
-          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+          <label for="remote-path-input" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
             Remote Path (in R2)
           </label>
           <div class="flex items-center">
             <span class="text-gray-500 dark:text-gray-400 mr-1">/</span>
             <input
+              id="remote-path-input"
               type="text"
               bind:value={newRemotePath}
               placeholder="backup/folder"

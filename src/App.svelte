@@ -9,6 +9,7 @@
   import Transfers from './routes/Transfers.svelte';
   import SyncFolders from './routes/SyncFolders.svelte';
   import UpdateScreen from './components/UpdateScreen.svelte';
+  import UploadQueue from './components/transfers/UploadQueue.svelte';
   import type { UploadProgress, DownloadProgress } from './lib/types';
 
   const routes = {
@@ -264,3 +265,6 @@
     on:later={handleUpdateLater}
   />
 {/if}
+
+<!-- Floating Upload Queue -->
+<UploadQueue />

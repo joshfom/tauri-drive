@@ -5,7 +5,7 @@
   import type { R2Object } from '../lib/types';
   import type { FileNode } from '../lib/utils/folderParser';
   import { parseObjectsIntoFolders, getAllFilesInFolder, calculateFolderSize, getBreadcrumbs } from '../lib/utils/folderParser';
-  import { uploadQueue, addToQueue, updateUploadProgress } from '../lib/stores/uploads';
+  import { uploadQueue, addToQueue, updateUploadProgress, currentBrowserPath } from '../lib/stores/uploads';
   import { formatBytes, formatDate } from '../lib/utils/formatters';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import CreateFolderDialog from '../components/CreateFolderDialog.svelte';
@@ -35,6 +35,9 @@
 
   $: breadcrumbs = currentPath ? [{ name: 'Home', path: '' }, ...getBreadcrumbs(currentPath)] : [{ name: 'Home', path: '' }];
   $: fileNodes = parseObjectsIntoFolders(objects, currentPath);
+  
+  // Sync currentPath to store whenever it changes
+  $: currentBrowserPath.set(currentPath);
 
   async function loadObjects() {
     loading = true;
@@ -286,6 +289,14 @@
   }
 
   onMount(() => {
+    // Restore the last browsed path from the store
+    const unsubscribe = currentBrowserPath.subscribe(path => {
+      if (path && currentPath === '') {
+        currentPath = path;
+      }
+    });
+    unsubscribe(); // Only read once on mount
+    
     loadObjects();
   });
 </script>

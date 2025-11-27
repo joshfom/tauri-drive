@@ -642,12 +642,18 @@ async fn upload_file_with_progress(
 
     // Use multipart upload for files > 100MB (with 8 concurrent uploads)
     if file_size > 100 * 1024 * 1024 {
+        log::info!(
+            "Starting multipart upload for {} ({} MB) with 5MB chunks",
+            file_name,
+            file_size / (1024 * 1024)
+        );
+        
         let app_clone = app.clone();
         let upload = r2::multipart::MultipartUpload::new(
             client_clone.clone(),
             bucket_clone.clone(),
             remote_key.clone(),
-            Some(10 * 1024 * 1024), // 10MB chunks
+            Some(5 * 1024 * 1024), // 5MB chunks for more frequent progress updates
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -656,6 +662,13 @@ async fn upload_file_with_progress(
         let parts = upload
             .upload_file_concurrent(&local_path, move |progress_info| {
                 let progress_pct = (progress_info.uploaded_bytes as f64 / progress_info.total_bytes as f64) * 100.0;
+                log::info!(
+                    "Emitting upload progress: {} - {:.1}% ({}/{} bytes)",
+                    upload_id_clone,
+                    progress_pct,
+                    progress_info.uploaded_bytes,
+                    progress_info.total_bytes
+                );
                 let progress_event = UploadProgress {
                     id: upload_id_clone.clone(),
                     file_name: file_name_clone.clone(),
@@ -669,7 +682,9 @@ async fn upload_file_with_progress(
                     status: UploadStatus::Uploading,
                     error_message: None,
                 };
-                app_clone.emit("upload-progress", &progress_event).ok();
+                if let Err(e) = app_clone.emit("upload-progress", &progress_event) {
+                    log::error!("Failed to emit upload progress event: {}", e);
+                }
             })
             .await
             .map_err(|e| {

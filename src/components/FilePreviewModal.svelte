@@ -148,14 +148,18 @@
   <div 
     class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4"
     on:click={handleClose}
+    on:keydown={(e) => e.key === 'Escape' && handleClose()}
     role="dialog"
     aria-modal="true"
     aria-labelledby="preview-title"
+    tabindex="-1"
   >
     <!-- Modal -->
     <div 
       class="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl max-w-5xl w-full max-h-[90vh] flex flex-col overflow-hidden"
       on:click|stopPropagation
+      on:keydown|stopPropagation
+      role="document"
     >
       <!-- Header -->
       <div class="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700">
@@ -187,6 +191,7 @@
         <button
           on:click={handleClose}
           class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+          aria-label="Close preview"
         >
           <svg class="w-6 h-6 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
@@ -251,7 +256,7 @@
             src={previewUrl}
             title={file.name}
             class="w-full h-[70vh] rounded-lg shadow-lg"
-          />
+          ></iframe>
         {:else if fileType === 'text' && textContent}
           <div class="bg-gray-900 rounded-lg shadow-lg overflow-auto max-h-[70vh]">
             <pre class="p-4 text-sm text-gray-100 font-mono whitespace-pre-wrap break-words"><code>{textContent}</code></pre>

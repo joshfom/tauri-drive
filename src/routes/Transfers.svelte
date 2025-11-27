@@ -4,10 +4,12 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import type { UploadProgress, DownloadProgress } from '../lib/types';
   import { formatBytes, formatDuration } from '../lib/utils/formatters';
+  import { uploadQueue } from '../lib/stores/uploads';
 
-  let uploads: UploadProgress[] = [];
+  // Use the shared upload queue store
+  $: uploads = $uploadQueue;
+  
   let downloads: Map<string, DownloadProgress> = new Map();
-  let loading = false;
   let activeTab: 'uploads' | 'downloads' = 'uploads';
   let unlistenDownload: UnlistenFn | null = null;
 
@@ -15,21 +17,9 @@
   $: activeDownloads = downloadsList.filter(d => d.status === 'downloading');
   $: activeUploads = uploads.filter(u => u.status.toLowerCase() === 'uploading');
 
-  async function loadActiveUploads() {
-    loading = true;
-    try {
-      uploads = await invoke<UploadProgress[]>('get_active_uploads');
-    } catch (e) {
-      console.error('Failed to load uploads:', e);
-    } finally {
-      loading = false;
-    }
-  }
-
   async function handleCancel(uploadId: string) {
     try {
       await invoke('cancel_upload', { uploadId });
-      await loadActiveUploads();
     } catch (e) {
       console.error('Failed to cancel upload:', e);
     }
@@ -59,10 +49,6 @@
   }
 
   onMount(() => {
-    loadActiveUploads();
-    // Refresh uploads every 2 seconds
-    const interval = setInterval(loadActiveUploads, 2000);
-
     // Listen for download progress events
     listen<DownloadProgress>('download-progress', (event) => {
       const progress = event.payload;
@@ -81,10 +67,6 @@
     }).then((unlisten) => {
       unlistenDownload = unlisten;
     });
-
-    return () => {
-      clearInterval(interval);
-    };
   });
 
   onDestroy(() => {
@@ -133,11 +115,7 @@
   <!-- Content -->
   <div class="flex-1 overflow-auto p-6">
     {#if activeTab === 'uploads'}
-      {#if loading && uploads.length === 0}
-        <div class="flex items-center justify-center h-64">
-          <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
-        </div>
-      {:else if uploads.length === 0}
+      {#if uploads.length === 0}
         <div class="text-center py-12">
           <svg
             class="mx-auto h-12 w-12 text-gray-400"
