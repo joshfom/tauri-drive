@@ -4,7 +4,7 @@
   import { save, open } from '@tauri-apps/plugin-dialog';
   import { check } from '@tauri-apps/plugin-updater';
   import { relaunch } from '@tauri-apps/plugin-process';
-  import type { R2Credentials } from '../lib/types';
+  import type { R2Credentials, StalledUpload, CleanupResult } from '../lib/types';
 
   let accountId = '';
   let accessKeyId = '';
@@ -34,6 +34,13 @@
   let migrationImporting = false;
   let migrationPreview: MigrationPreview | null = null;
   let migrationError = '';
+
+  // Stalled uploads cleanup state
+  let stalledUploads: StalledUpload[] | null = null;
+  let checkingStalledUploads = false;
+  let cleaningUpStalledUploads = false;
+  let stalledUploadsError = '';
+  let cleanupResult: CleanupResult | null = null;
 
   interface MigrationPreview {
     version: number;
@@ -367,6 +374,58 @@
     migrationPreview = null;
     migrationError = '';
   }
+
+  // Stalled uploads cleanup functions
+  async function handleCheckStalledUploads() {
+    stalledUploadsError = '';
+    cleanupResult = null;
+    checkingStalledUploads = true;
+    
+    try {
+      stalledUploads = await invoke<StalledUpload[]>('list_stalled_uploads', {
+        maxAgeHours: 24 // Show uploads older than 24 hours
+      });
+    } catch (e) {
+      stalledUploadsError = `Failed to check for stalled uploads: ${e}`;
+      stalledUploads = null;
+    } finally {
+      checkingStalledUploads = false;
+    }
+  }
+
+  async function abortSingleUpload(upload: StalledUpload) {
+    stalledUploadsError = '';
+    
+    try {
+      await invoke('abort_stalled_upload', {
+        key: upload.key,
+        uploadId: upload.upload_id
+      });
+      
+      // Remove from list
+      if (stalledUploads) {
+        stalledUploads = stalledUploads.filter(u => u.upload_id !== upload.upload_id);
+      }
+    } catch (e) {
+      stalledUploadsError = `Failed to abort upload: ${e}`;
+    }
+  }
+
+  async function handleCleanupStalledUploads() {
+    stalledUploadsError = '';
+    cleaningUpStalledUploads = true;
+    
+    try {
+      cleanupResult = await invoke<CleanupResult>('cleanup_stalled_uploads', {
+        maxAgeHours: 24 // Clean up uploads older than 24 hours
+      });
+      stalledUploads = []; // Clear the list after cleanup
+    } catch (e) {
+      stalledUploadsError = `Failed to cleanup stalled uploads: ${e}`;
+    } finally {
+      cleaningUpStalledUploads = false;
+    }
+  }
 </script>
 
 <div class="flex flex-col h-full bg-white dark:bg-gray-900">
@@ -601,6 +660,125 @@
           
           <p class="text-xs text-gray-500 dark:text-gray-400">
             Backups are encrypted with a password you choose. Keep your password safe!
+          </p>
+        </div>
+      </div>
+
+      <!-- Storage Maintenance -->
+      <div class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl">
+        <div class="p-4 border-b border-gray-200 dark:border-gray-700">
+          <div class="flex items-center gap-3">
+            <div class="w-10 h-10 bg-orange-500 rounded-lg flex items-center justify-center">
+              <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+              </svg>
+            </div>
+            <div>
+              <h3 class="font-medium text-gray-900 dark:text-white">Storage Maintenance</h3>
+              <p class="text-sm text-gray-500 dark:text-gray-400">Clean up stalled uploads and free storage space</p>
+            </div>
+          </div>
+        </div>
+        
+        <div class="p-4 space-y-4">
+          <p class="text-sm text-gray-600 dark:text-gray-400">
+            Multipart uploads that get interrupted may leave incomplete parts in your R2 bucket. 
+            Clean them up to free storage space and avoid clutter.
+          </p>
+          
+          {#if stalledUploadsError}
+            <div class="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+              <p class="text-sm text-red-700 dark:text-red-400">{stalledUploadsError}</p>
+            </div>
+          {/if}
+          
+          {#if cleanupResult}
+            <div class="p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg">
+              <p class="text-sm text-green-700 dark:text-green-400">
+                ✓ Cleaned up {cleanupResult.cleaned_count} stalled upload{cleanupResult.cleaned_count !== 1 ? 's' : ''} 
+                (older than {cleanupResult.threshold_hours} hours)
+              </p>
+            </div>
+          {/if}
+          
+          {#if stalledUploads && stalledUploads.length > 0}
+            <div class="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+              <div class="p-3 bg-gray-50 dark:bg-gray-700/50 border-b border-gray-200 dark:border-gray-700">
+                <p class="text-sm font-medium text-gray-900 dark:text-white">
+                  Found {stalledUploads.length} incomplete upload{stalledUploads.length !== 1 ? 's' : ''}
+                </p>
+              </div>
+              <div class="max-h-48 overflow-auto">
+                {#each stalledUploads as upload}
+                  <div class="p-3 border-b border-gray-100 dark:border-gray-700 last:border-0 flex items-center justify-between gap-3">
+                    <div class="min-w-0 flex-1">
+                      <p class="text-sm font-medium text-gray-900 dark:text-white truncate" title={upload.key}>
+                        {upload.key.split('/').pop() || upload.key}
+                      </p>
+                      <p class="text-xs text-gray-500 dark:text-gray-400">
+                        {upload.age_hours} hour{upload.age_hours !== 1 ? 's' : ''} old
+                      </p>
+                    </div>
+                    <button
+                      on:click={() => abortSingleUpload(upload)}
+                      class="shrink-0 px-2 py-1 text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 rounded transition-colors"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {:else if stalledUploads && stalledUploads.length === 0}
+            <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+              <p class="text-sm text-gray-600 dark:text-gray-400 text-center">
+                ✓ No stalled uploads found
+              </p>
+            </div>
+          {/if}
+          
+          <div class="flex gap-3">
+            <button
+              on:click={handleCheckStalledUploads}
+              disabled={checkingStalledUploads || !isConnected}
+              class="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50 transition-colors"
+            >
+              {#if checkingStalledUploads}
+                <svg class="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <span>Checking...</span>
+              {:else}
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+                </svg>
+                <span>Check for Stalled Uploads</span>
+              {/if}
+            </button>
+            
+            <button
+              on:click={handleCleanupStalledUploads}
+              disabled={cleaningUpStalledUploads || !isConnected || !stalledUploads || stalledUploads.length === 0}
+              class="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-orange-600 hover:bg-orange-700 disabled:bg-gray-400 disabled:cursor-not-allowed rounded-lg transition-colors"
+            >
+              {#if cleaningUpStalledUploads}
+                <svg class="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <span>Cleaning...</span>
+              {:else}
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                </svg>
+                <span>Clean Up All (24h+)</span>
+              {/if}
+            </button>
+          </div>
+          
+          <p class="text-xs text-gray-500 dark:text-gray-400">
+            Cleanup removes uploads older than 24 hours. This is safe as legitimate uploads typically complete within minutes.
           </p>
         </div>
       </div>

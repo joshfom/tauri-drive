@@ -592,6 +592,89 @@ async fn rename_file(
 }
 
 #[tauri::command]
+async fn list_stalled_uploads(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<r2::operations::StalledUpload>, String> {
+    let app_state = state.lock().await;
+    let client_guard = app_state.r2_client.lock().await;
+    
+    let client = client_guard
+        .as_ref()
+        .ok_or("Not connected to R2")?;
+
+    let uploads = r2::operations::list_multipart_uploads(
+        client.client(),
+        client.bucket(),
+    )
+    .await
+    .map_err(|e| format!("Failed to list multipart uploads: {}", e))?;
+
+    Ok(uploads)
+}
+
+#[tauri::command]
+async fn cleanup_stalled_uploads(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    max_age_hours: Option<i64>,
+) -> Result<CleanupResult, String> {
+    let app_state = state.lock().await;
+    let client_guard = app_state.r2_client.lock().await;
+    
+    let client = client_guard
+        .as_ref()
+        .ok_or("Not connected to R2")?;
+
+    // Default to 24 hours (1 day) if not specified
+    let threshold_hours = max_age_hours.unwrap_or(24);
+
+    let (cleaned_count, cleaned_uploads) = r2::operations::cleanup_stalled_uploads(
+        client.client(),
+        client.bucket(),
+        threshold_hours,
+    )
+    .await
+    .map_err(|e| format!("Failed to cleanup stalled uploads: {}", e))?;
+
+    Ok(CleanupResult {
+        cleaned_count,
+        cleaned_uploads,
+        threshold_hours,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct CleanupResult {
+    cleaned_count: i32,
+    cleaned_uploads: Vec<r2::operations::StalledUpload>,
+    threshold_hours: i64,
+}
+
+#[tauri::command]
+async fn abort_stalled_upload(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    key: String,
+    upload_id: String,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+    let client_guard = app_state.r2_client.lock().await;
+    
+    let client = client_guard
+        .as_ref()
+        .ok_or("Not connected to R2")?;
+
+    r2::operations::abort_multipart_upload(
+        client.client(),
+        client.bucket(),
+        &key,
+        &upload_id,
+    )
+    .await
+    .map_err(|e| format!("Failed to abort upload: {}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_active_uploads(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<UploadProgress>, String> {
@@ -1538,6 +1621,9 @@ pub fn run() {
             hide_to_tray,
             show_from_tray,
             rename_file,
+            list_stalled_uploads,
+            cleanup_stalled_uploads,
+            abort_stalled_upload,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,6 +1,6 @@
 [package]
 name = "cloudflare-backup"
-version = "0.2.3"
+version = "0.2.4"
 description = "Cloudflare R2 Backup Application"
 authors = ["you"]
 edition = "2021"

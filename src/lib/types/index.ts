@@ -88,3 +88,16 @@ export interface DownloadProgress {
   status: 'pending' | 'downloading' | 'paused' | 'completed' | 'failed' | 'cancelled';
   errorMessage?: string;
 }
+
+export interface StalledUpload {
+  upload_id: string;
+  key: string;
+  initiated: string;
+  age_hours: number;
+}
+
+export interface CleanupResult {
+  cleaned_count: number;
+  cleaned_uploads: StalledUpload[];
+  threshold_hours: number;
+}

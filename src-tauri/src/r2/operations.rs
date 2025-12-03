@@ -254,3 +254,129 @@ pub async fn copy_object(
 
     Ok(())
 }
+
+/// Information about a stalled multipart upload
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StalledUpload {
+    pub upload_id: String,
+    pub key: String,
+    pub initiated: String,
+    pub age_hours: i64,
+}
+
+/// List all in-progress multipart uploads in the bucket
+pub async fn list_multipart_uploads(
+    client: &Client,
+    bucket: &str,
+) -> Result<Vec<StalledUpload>> {
+    let response = client
+        .list_multipart_uploads()
+        .bucket(bucket)
+        .send()
+        .await
+        .context("Failed to list multipart uploads")?;
+
+    let mut uploads = Vec::new();
+    let now = chrono::Utc::now();
+
+    if let Some(upload_list) = response.uploads {
+        for upload in upload_list {
+            let upload_id = upload.upload_id().unwrap_or("").to_string();
+            let key = upload.key().unwrap_or("").to_string();
+            
+            let initiated = upload.initiated()
+                .map(|dt| dt.to_string())
+                .unwrap_or_default();
+            
+            // Calculate age in hours
+            let age_hours = upload.initiated()
+                .and_then(|dt| {
+                    DateTime::parse_from_rfc3339(&dt.to_string()).ok()
+                })
+                .map(|dt| {
+                    let duration = now.signed_duration_since(dt.with_timezone(&chrono::Utc));
+                    duration.num_hours()
+                })
+                .unwrap_or(0);
+
+            uploads.push(StalledUpload {
+                upload_id,
+                key,
+                initiated,
+                age_hours,
+            });
+        }
+    }
+
+    log::info!("Found {} in-progress multipart uploads", uploads.len());
+    Ok(uploads)
+}
+
+/// Abort a specific multipart upload
+pub async fn abort_multipart_upload(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<()> {
+    client
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await
+        .context(format!("Failed to abort multipart upload {} for key {}", upload_id, key))?;
+
+    log::info!("Aborted multipart upload {} for key {}", upload_id, key);
+    Ok(())
+}
+
+/// Clean up stalled multipart uploads older than the specified hours
+/// Returns the number of uploads cleaned up
+pub async fn cleanup_stalled_uploads(
+    client: &Client,
+    bucket: &str,
+    max_age_hours: i64,
+) -> Result<(i32, Vec<StalledUpload>)> {
+    let uploads = list_multipart_uploads(client, bucket).await?;
+    
+    let stalled: Vec<StalledUpload> = uploads
+        .into_iter()
+        .filter(|u| u.age_hours >= max_age_hours)
+        .collect();
+
+    let mut cleaned_count = 0;
+    let mut cleaned_uploads = Vec::new();
+
+    for upload in &stalled {
+        match abort_multipart_upload(client, bucket, &upload.key, &upload.upload_id).await {
+            Ok(_) => {
+                cleaned_count += 1;
+                cleaned_uploads.push(upload.clone());
+                log::info!(
+                    "Cleaned up stalled upload: {} (age: {} hours)",
+                    upload.key,
+                    upload.age_hours
+                );
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to clean up upload {} for key {}: {}",
+                    upload.upload_id,
+                    upload.key,
+                    e
+                );
+            }
+        }
+    }
+
+    log::info!(
+        "Cleanup complete: {} stalled uploads removed (threshold: {} hours)",
+        cleaned_count,
+        max_age_hours
+    );
+
+    Ok((cleaned_count, cleaned_uploads))
+}
+
