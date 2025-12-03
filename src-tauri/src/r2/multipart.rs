@@ -5,7 +5,7 @@ use anyhow::{Result, Context};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::fs::File;
 use tokio::sync::{Mutex, Semaphore};
@@ -14,6 +14,9 @@ use futures::future::join_all;
 const DEFAULT_CHUNK_SIZE: usize = 5 * 1024 * 1024; // 5MB for more frequent progress updates
 const MIN_CHUNK_SIZE: usize = 5 * 1024 * 1024; // 5MB minimum for S3
 const MAX_CONCURRENT_UPLOADS: usize = 8; // 8 concurrent chunk uploads
+const MAX_RETRIES: u32 = 5; // Maximum retries per part
+const INITIAL_BACKOFF_MS: u64 = 1000; // 1 second initial backoff
+const MAX_BACKOFF_MS: u64 = 30000; // 30 seconds max backoff
 
 /// Progress information for uploads
 #[derive(Clone)]
@@ -99,25 +102,52 @@ impl MultipartUpload {
         part_number: i32,
         data: Vec<u8>,
     ) -> Result<String> {
-        let body = ByteStream::from(data);
+        let mut last_error = None;
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
+        
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                log::warn!(
+                    "Retrying part {} upload (attempt {}/{}), waiting {}ms...",
+                    part_number, attempt + 1, MAX_RETRIES, backoff_ms
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+            }
+            
+            let body = ByteStream::from(data.clone());
 
-        let response = client
-            .upload_part()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(body)
-            .send()
-            .await
-            .context(format!("Failed to upload part {}", part_number))?;
+            match client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(body)
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let etag = response.e_tag()
+                        .context(format!("No ETag returned for part {}", part_number))?
+                        .to_string();
 
-        let etag = response.e_tag()
-            .context(format!("No ETag returned for part {}", part_number))?
-            .to_string();
-
-        log::debug!("Uploaded part {} with ETag: {}", part_number, etag);
-        Ok(etag)
+                    log::debug!("Uploaded part {} with ETag: {} (attempt {})", part_number, etag, attempt + 1);
+                    return Ok(etag);
+                }
+                Err(e) => {
+                    log::error!("Part {} upload failed (attempt {}): {}", part_number, attempt + 1, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+        
+        Err(anyhow::anyhow!(
+            "Failed to upload part {} after {} attempts: {}",
+            part_number,
+            MAX_RETRIES,
+            last_error.map(|e| e.to_string()).unwrap_or_default()
+        ))
     }
 
     pub async fn complete(&self, mut parts: Vec<(i32, String)>) -> Result<()> {
@@ -140,18 +170,45 @@ impl MultipartUpload {
             .set_parts(Some(completed_parts))
             .build();
 
-        self.client
-            .complete_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&self.key)
-            .upload_id(&self.upload_id)
-            .multipart_upload(completed_upload)
-            .send()
-            .await
-            .context("Failed to complete multipart upload")?;
-
-        log::info!("Successfully completed multipart upload for key: {}", self.key);
-        Ok(())
+        // Retry logic for completing multipart upload
+        let mut last_error = None;
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
+        
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                log::warn!(
+                    "Retrying complete multipart upload (attempt {}/{}), waiting {}ms...",
+                    attempt + 1, MAX_RETRIES, backoff_ms
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+            }
+            
+            match self.client
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .upload_id(&self.upload_id)
+                .multipart_upload(completed_upload.clone())
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    log::info!("Successfully completed multipart upload for key: {} (attempt {})", self.key, attempt + 1);
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::error!("Complete multipart upload failed (attempt {}): {}", attempt + 1, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+        
+        Err(anyhow::anyhow!(
+            "Failed to complete multipart upload after {} attempts: {}",
+            MAX_RETRIES,
+            last_error.map(|e| e.to_string()).unwrap_or_default()
+        ))
     }
 
     pub async fn abort(&self) -> Result<()> {

@@ -1090,6 +1090,8 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-runtime",
+ "aws-smithy-types",
  "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
